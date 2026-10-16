@@ -1,0 +1,30 @@
+{
+  "name": "SK Filterbank",
+  "params": [
+    {"key": "drive",    "name": "Drive",       "min": 0, "max": 1, "default": 0.25},
+    {"key": "freq_a",   "name": "Freq A",      "min": 0, "max": 1, "default": 0.54},
+    {"key": "reso_a",   "name": "Reso A",      "min": 0, "max": 1, "default": 0.35},
+    {"key": "mode_a",   "name": "Mode A",      "min": 0, "max": 1, "default": 0},
+    {"key": "freq_b",   "name": "Freq B",      "min": 0, "max": 1, "default": 1},
+    {"key": "reso_b",   "name": "Reso B",      "min": 0, "max": 1, "default": 0},
+    {"key": "mode_b",   "name": "Mode B",      "min": 0, "max": 1, "default": 0},
+    {"key": "routing",  "name": "Routing",     "options": ["Series", "Parallel"], "default": 0},
+    {"key": "env_amt",  "name": "Env Amount",  "min": 0, "max": 1, "default": 0.5},
+    {"key": "env_atk",  "name": "Env Attack",  "min": 0, "max": 1, "default": 0.1},
+    {"key": "env_rel",  "name": "Env Release", "min": 0, "max": 1, "default": 0.3},
+    {"key": "lfo_rate", "name": "LFO Rate",    "min": 0, "max": 1, "default": 0.3},
+    {"key": "lfo_amt",  "name": "LFO Amount",  "min": 0, "max": 1, "default": 0},
+    {"key": "grit",     "name": "Grit",        "min": 0, "max": 1, "default": 0.3},
+    {"key": "output",   "name": "Output",      "min": 0, "max": 1, "default": 0.6667},
+    {"key": "mix",      "name": "Mix",         "min": 0, "max": 1, "default": 1}
+  ],
+  "sections": [
+    {"label": "Input",    "keys": ["drive", "grit"]},
+    {"label": "Filter A", "keys": ["freq_a", "reso_a", "mode_a"]},
+    {"label": "Filter B", "keys": ["freq_b", "reso_b", "mode_b"]},
+    {"label": "Envelope", "keys": ["env_amt", "env_atk", "env_rel"]},
+    {"label": "LFO",      "keys": ["lfo_rate", "lfo_amt"]},
+    {"label": "Routing",  "keys": ["routing"]},
+    {"label": "Output",   "keys": ["output", "mix"]}
+  ]
+}

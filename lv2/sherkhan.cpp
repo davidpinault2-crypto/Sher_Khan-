@@ -1,9 +1,8 @@
-// LV2 wrapper for ShermanCore. The minimal LV2 core ABI is declared inline so
-// the plugin builds without the lv2 dev headers (handy for cross-compiling).
+// LV2 wrapper for ShermanCore (desktop hosts: handy for listening tests). The minimal LV2 core ABI is
+// declared inline so the plugin builds without the lv2 dev headers.
 #include "../dsp/ShermanCore.h"
 
 #include <cstdint>
-#include <cstring>
 #include <new>
 
 extern "C" {
@@ -24,19 +23,14 @@ typedef struct LV2_Descriptor {
 namespace {
 
 constexpr const char* kUri = "https://github.com/davidpinault2-crypto/Sher_Khan-#sherkhan";
-
-enum Port : uint32_t {
-    kInL, kInR, kOutL, kOutR,
-    kDrive, kFreqA, kResoA, kModeA, kFreqB, kResoB, kModeB, kRouting,
-    kEnvAmt, kEnvAtk, kEnvRel, kLfoRate, kLfoAmt, kGrit, kOutput, kMix,
-    kNumPorts
-};
+// Ports 0-3 are audio (in L, in R, out L, out R); ports 4.. are the parameters in sk::ParamId order.
+constexpr uint32_t kFirstControl = 4;
 
 struct Plugin {
     sk::ShermanCore core;
     const float* in[2] = {};
     float* out[2] = {};
-    const float* ctl[kNumPorts] = {};
+    const float* ctl[sk::kNumParams] = {};
 };
 
 LV2_Handle instantiate(const LV2_Descriptor*, double rate, const char*, const LV2_Feature* const*) {
@@ -47,41 +41,17 @@ LV2_Handle instantiate(const LV2_Descriptor*, double rate, const char*, const LV
 
 void connect(LV2_Handle h, uint32_t port, void* data) {
     auto* p = static_cast<Plugin*>(h);
-    switch (port) {
-        case kInL:  p->in[0] = static_cast<const float*>(data); break;
-        case kInR:  p->in[1] = static_cast<const float*>(data); break;
-        case kOutL: p->out[0] = static_cast<float*>(data); break;
-        case kOutR: p->out[1] = static_cast<float*>(data); break;
-        default: if (port < kNumPorts) p->ctl[port] = static_cast<const float*>(data);
-    }
+    if (port < 2) p->in[port] = static_cast<const float*>(data);
+    else if (port < 4) p->out[port - 2] = static_cast<float*>(data);
+    else if (port - kFirstControl < sk::kNumParams) p->ctl[port - kFirstControl] = static_cast<const float*>(data);
 }
 
 void activate(LV2_Handle h) { static_cast<Plugin*>(h)->core.reset(); }
 
-float ctl(const Plugin* p, Port port, float fallback) {
-    return p->ctl[port] ? *p->ctl[port] : fallback;
-}
-
 void run(LV2_Handle h, uint32_t n) {
     auto* p = static_cast<Plugin*>(h);
-    sk::Params d, q;
-    q.drive = ctl(p, kDrive, d.drive);
-    q.freqA = ctl(p, kFreqA, d.freqA);
-    q.resoA = ctl(p, kResoA, d.resoA);
-    q.modeA = ctl(p, kModeA, d.modeA);
-    q.freqB = ctl(p, kFreqB, d.freqB);
-    q.resoB = ctl(p, kResoB, d.resoB);
-    q.modeB = ctl(p, kModeB, d.modeB);
-    q.parallel = ctl(p, kRouting, 0.f) >= 0.5f ? 1 : 0;
-    q.envAmount = ctl(p, kEnvAmt, d.envAmount);
-    q.envAttack = ctl(p, kEnvAtk, d.envAttack);
-    q.envRelease = ctl(p, kEnvRel, d.envRelease);
-    q.lfoRate = ctl(p, kLfoRate, d.lfoRate);
-    q.lfoAmount = ctl(p, kLfoAmt, d.lfoAmount);
-    q.grit = ctl(p, kGrit, d.grit);
-    q.output = ctl(p, kOutput, d.output);
-    q.mix = ctl(p, kMix, d.mix);
-    p->core.setParams(q);
+    for (int i = 0; i < sk::kNumParams; ++i)
+        if (p->ctl[i]) p->core.setParam(i, *p->ctl[i]);
     if (p->in[0] && p->out[0]) p->core.process(p->in[0], p->in[1], p->out[0], p->out[1], n);
 }
 

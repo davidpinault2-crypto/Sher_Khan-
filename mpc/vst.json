@@ -1,0 +1,10 @@
+{
+  "name": "SK Filterbank",
+  "vendor": "Sher Khan",
+  "uid": "ShKf",
+  "version": 1000,
+  "so": "sk_filterbank.so",
+  "params": "params.json",
+  "layout": "layout.conf",
+  "effect": true
+}
