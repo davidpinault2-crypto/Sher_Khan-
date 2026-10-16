@@ -1,30 +1,358 @@
 {
   "name": "SK Filterbank",
   "params": [
-    {"key": "drive",    "name": "Drive",       "min": 0, "max": 1, "default": 0.25},
-    {"key": "freq_a",   "name": "Freq A",      "min": 0, "max": 1, "default": 0.54},
-    {"key": "reso_a",   "name": "Reso A",      "min": 0, "max": 1, "default": 0.35},
-    {"key": "mode_a",   "name": "Mode A",      "min": 0, "max": 1, "default": 0},
-    {"key": "freq_b",   "name": "Freq B",      "min": 0, "max": 1, "default": 1},
-    {"key": "reso_b",   "name": "Reso B",      "min": 0, "max": 1, "default": 0},
-    {"key": "mode_b",   "name": "Mode B",      "min": 0, "max": 1, "default": 0},
-    {"key": "routing",  "name": "Routing",     "options": ["Series", "Parallel"], "default": 0},
-    {"key": "env_amt",  "name": "Env Amount",  "min": 0, "max": 1, "default": 0.5},
-    {"key": "env_atk",  "name": "Env Attack",  "min": 0, "max": 1, "default": 0.1},
-    {"key": "env_rel",  "name": "Env Release", "min": 0, "max": 1, "default": 0.3},
-    {"key": "lfo_rate", "name": "LFO Rate",    "min": 0, "max": 1, "default": 0.3},
-    {"key": "lfo_amt",  "name": "LFO Amount",  "min": 0, "max": 1, "default": 0},
-    {"key": "grit",     "name": "Grit",        "min": 0, "max": 1, "default": 0.3},
-    {"key": "output",   "name": "Output",      "min": 0, "max": 1, "default": 0.6667},
-    {"key": "mix",      "name": "Mix",         "min": 0, "max": 1, "default": 1}
+    {
+      "key": "input",
+      "name": "Input",
+      "min": 0,
+      "max": 1,
+      "default": 0.55
+    },
+    {
+      "key": "input_eq",
+      "name": "Input EQ",
+      "options": [
+        "Hi Cut",
+        "Flat",
+        "Hi Boost"
+      ],
+      "default": 1
+    },
+    {
+      "key": "fm",
+      "name": "FM",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "key": "lfo_speed",
+      "name": "LFO Speed",
+      "min": 0,
+      "max": 1,
+      "default": 0.35
+    },
+    {
+      "key": "lfo_depth",
+      "name": "LFO Depth",
+      "min": 0,
+      "max": 1,
+      "default": 0.5
+    },
+    {
+      "key": "lfo_shape",
+      "name": "LFO Shape",
+      "options": [
+        "Sine",
+        "Saw",
+        "Sine Trig"
+      ],
+      "default": 0
+    },
+    {
+      "key": "lfo_f2",
+      "name": "LFO F2",
+      "options": [
+        "Same",
+        "Inverted"
+      ],
+      "default": 0
+    },
+    {
+      "key": "attack",
+      "name": "Attack",
+      "min": 0,
+      "max": 1,
+      "default": 0.2
+    },
+    {
+      "key": "decay",
+      "name": "Decay",
+      "min": 0,
+      "max": 1,
+      "default": 0.4
+    },
+    {
+      "key": "sustain",
+      "name": "Sustain",
+      "min": 0,
+      "max": 1,
+      "default": 0.75
+    },
+    {
+      "key": "release",
+      "name": "Release",
+      "min": 0,
+      "max": 1,
+      "default": 0.4
+    },
+    {
+      "key": "env_mode",
+      "name": "Env Mode",
+      "options": [
+        "ADSR",
+        "AR",
+        "Follow"
+      ],
+      "default": 0
+    },
+    {
+      "key": "trig_mode",
+      "name": "Trig Mode",
+      "options": [
+        "Normal",
+        "SensiTrig",
+        "Limit"
+      ],
+      "default": 0
+    },
+    {
+      "key": "freq_1",
+      "name": "Freq 1",
+      "min": 0,
+      "max": 1,
+      "default": 0.54
+    },
+    {
+      "key": "reso_1",
+      "name": "Reso 1",
+      "min": 0,
+      "max": 1,
+      "default": 0.35
+    },
+    {
+      "key": "adsr_1",
+      "name": "ADSR 1",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "key": "lbh_1",
+      "name": "L-B-H 1",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "key": "corr_1",
+      "name": "Corr 1",
+      "min": 0,
+      "max": 1,
+      "default": 0.5
+    },
+    {
+      "key": "freq_2",
+      "name": "Freq 2",
+      "min": 0,
+      "max": 1,
+      "default": 1
+    },
+    {
+      "key": "reso_2",
+      "name": "Reso 2",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "key": "adsr_2",
+      "name": "ADSR 2",
+      "min": 0,
+      "max": 1,
+      "default": 0.5
+    },
+    {
+      "key": "lbh_2",
+      "name": "L-B-H 2",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "key": "corr_2",
+      "name": "Corr 2",
+      "min": 0,
+      "max": 1,
+      "default": 0.5
+    },
+    {
+      "key": "harmonics",
+      "name": "Harmonics",
+      "options": [
+        "Free",
+        "1:1",
+        "2:3",
+        "1:2",
+        "1:3",
+        "1:4",
+        "1:5",
+        "1:6",
+        "1:8",
+        "1:10",
+        "1:12",
+        "1:16"
+      ],
+      "default": 0
+    },
+    {
+      "key": "par_ser",
+      "name": "Par/Ser",
+      "min": 0,
+      "max": 1,
+      "default": 1
+    },
+    {
+      "key": "am",
+      "name": "AM",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "key": "byp_eff",
+      "name": "Byp/Eff",
+      "min": 0,
+      "max": 1,
+      "default": 1
+    },
+    {
+      "key": "output",
+      "name": "Output",
+      "min": 0,
+      "max": 1,
+      "default": 0.6667
+    },
+    {
+      "key": "grit",
+      "name": "Grit",
+      "min": 0,
+      "max": 1,
+      "default": 0.4
+    },
+    {
+      "key": "trig",
+      "name": "Trig",
+      "min": 0,
+      "max": 1,
+      "momentary": true
+    },
+    {
+      "key": "preset",
+      "name": "Preset",
+      "min": 0,
+      "max": 27,
+      "display": "int",
+      "type": "stepper"
+    },
+    {
+      "key": "preset_prev",
+      "name": "Prev",
+      "min": 0,
+      "max": 1,
+      "momentary": true
+    },
+    {
+      "key": "preset_next",
+      "name": "Next",
+      "min": 0,
+      "max": 1,
+      "momentary": true
+    },
+    {
+      "key": "load",
+      "name": "Load",
+      "min": 0,
+      "max": 1,
+      "momentary": true
+    },
+    {
+      "key": "save",
+      "name": "Save",
+      "min": 0,
+      "max": 1,
+      "momentary": true
+    },
+    {
+      "key": "status",
+      "name": "Status",
+      "min": 0,
+      "max": 1,
+      "display": "string",
+      "type": "readout"
+    }
   ],
   "sections": [
-    {"label": "Input",    "keys": ["drive", "grit"]},
-    {"label": "Filter A", "keys": ["freq_a", "reso_a", "mode_a"]},
-    {"label": "Filter B", "keys": ["freq_b", "reso_b", "mode_b"]},
-    {"label": "Envelope", "keys": ["env_amt", "env_atk", "env_rel"]},
-    {"label": "LFO",      "keys": ["lfo_rate", "lfo_amt"]},
-    {"label": "Routing",  "keys": ["routing"]},
-    {"label": "Output",   "keys": ["output", "mix"]}
+    {
+      "label": "Input",
+      "keys": [
+        "input",
+        "input_eq"
+      ]
+    },
+    {
+      "label": "Filter 1",
+      "keys": [
+        "freq_1",
+        "reso_1",
+        "adsr_1",
+        "lbh_1",
+        "corr_1"
+      ]
+    },
+    {
+      "label": "Filter 2",
+      "keys": [
+        "freq_2",
+        "reso_2",
+        "adsr_2",
+        "lbh_2",
+        "corr_2",
+        "harmonics"
+      ]
+    },
+    {
+      "label": "Envelope",
+      "keys": [
+        "attack",
+        "decay",
+        "sustain",
+        "release",
+        "env_mode",
+        "trig_mode",
+        "trig"
+      ]
+    },
+    {
+      "label": "LFO",
+      "keys": [
+        "lfo_speed",
+        "lfo_depth",
+        "lfo_shape",
+        "lfo_f2",
+        "fm"
+      ]
+    },
+    {
+      "label": "Output",
+      "keys": [
+        "par_ser",
+        "am",
+        "byp_eff",
+        "output",
+        "grit"
+      ]
+    },
+    {
+      "label": "Presets",
+      "keys": [
+        "preset",
+        "preset_prev",
+        "preset_next",
+        "load",
+        "save",
+        "status"
+      ]
+    }
   ]
 }

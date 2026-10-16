@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build SK Filterbank for the Akai Force (MPC OS 3.x, Gen1 armv7) as an installable zip:
 #
-#   mpc/build.sh [version]          default version: 0.1.0
+#   mpc/build.sh [version]          default version: 0.2.0
 #
 # Output: dist/SK-Filterbank-<version>-mpc-armv7.zip (plugin folder + install.sh/uninstall.sh, see mpc/README.md).
 #
@@ -12,7 +12,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.2.0}"
 MPC_VST_REF=3a54b72cd172c840881b0be4f887653cc0829bf0   # the toolkit commit this was built and checked with
 MPC_VST="${MPC_VST:-$ROOT/../mpc-vst-plugins}"
 SO=sk_filterbank.so
@@ -51,7 +51,7 @@ glibc=$($READELF -V "$ELF" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -
 $READELF -h "$ELF" | grep -q "hard-float ABI" || die "not a hard-float build"
 echo "exports: $exports| needs: $needed| highest glibc symbol: $glibc (Force: 2.39)"
 
-echo "== 4. Skin (mpc-vst-plugins shadow_skin, Titillium titles)"
+echo "== 4. Skin (mpc-vst-plugins shadow_skin, Titillium titles, colour-coded knobs from mpc/skin_post.py)"
 python3 mpc/check_params.py
 rm -rf "$B"
 mkdir -p "$B/preview"
@@ -65,8 +65,8 @@ cp "$MPC_VST/LICENSE" "$B/notices/LICENSE-mpc-vst-plugins.txt"
 cp "$MPC_VST/tools/html_art/fonts/OFL.txt" "$B/notices/OFL-TitilliumWeb.txt"
 rm -f dist/SK-Filterbank-"$VERSION"-mpc-armv7.zip
 python3 "$MPC_VST/tools/release.py" --so "$ELF" --skin "$B/skin/$SKIN" --entry "$B/pluginlist-entry.xml" \
-    --version "$VERSION" --extra "$B/notices:notices" \
-    --about "Dual 12 dB multimode filter with input overdrive and switched-capacitor grit, modelled on the Sherman Filterbank 2 from public descriptions (no hardware measurements yet)." \
+    --version "$VERSION" --extra "$B/notices:notices" --user-data presets \
+    --about "Two multimode filters with overdrive, ADSR/AR/follower, LFO, FM and AM, laid out like the Sherman Filterbank 2 (modelled from public descriptions, no hardware measurements yet). Your User presets live in presets/ inside the plugin folder and survive upgrades." \
     --requires "Root SSH access to the Force (e.g. MockbaMod)" -o dist
 python3 "$MPC_VST/tools/catalog_check.py" dist/SK-Filterbank-"$VERSION"-mpc-armv7.zip
 echo "Done: dist/SK-Filterbank-$VERSION-mpc-armv7.zip  (skin preview: $B/preview/page_0.png)"
