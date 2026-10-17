@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build SK Filterbank for the Akai Force (MPC OS 3.x, Gen1 armv7) as an installable zip:
 #
-#   mpc/build.sh [version]          default version: 0.2.0
+#   mpc/build.sh [version]          default version: 0.3.0
 #
 # Output: dist/SK-Filterbank-<version>-mpc-armv7.zip (plugin folder + install.sh/uninstall.sh, see mpc/README.md).
 #
@@ -12,7 +12,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
-VERSION="${1:-0.2.0}"
+VERSION="${1:-0.3.0}"
 MPC_VST_REF=3a54b72cd172c840881b0be4f887653cc0829bf0   # the toolkit commit this was built and checked with
 MPC_VST="${MPC_VST:-$ROOT/../mpc-vst-plugins}"
 SO=sk_filterbank.so

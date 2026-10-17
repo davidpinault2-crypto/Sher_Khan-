@@ -9,6 +9,8 @@
 // the track program, so whatever the knobs are at is what the project brings back. Presets: 12 factory sounds and
 // 16 user slots, listed as VST programs in MPC's PRESET menu and browsable on the plugin's PRESETS page, where
 // SAVE stores the current sound in the selected user slot (a small text file in presets/ next to the .so).
+// Loading a preset while audio runs crossfades from the old sound to the new one (30 ms) instead of gliding every
+// knob through the values in between.
 //
 // No C++ runtime dependency: no exceptions, RTTI, iostreams, static constructors or operator new, so the .so only
 // needs libc and libm (checked by mpc/build.sh).
@@ -63,7 +65,7 @@ constexpr int32_t kPlugCategEffect = 1;
 
 // ---- Identity (keep uid and the parameter order fixed across releases: projects store both) --------------
 constexpr int32_t kUniqueId = 0x53684b66;  // 'ShKf'
-constexpr int32_t kVersion = 2000;         // 0.2.0
+constexpr int32_t kVersion = 3000;         // 0.3.0
 constexpr const char* kName = "SK Filterbank";
 constexpr const char* kVendor = "Sher Khan";
 constexpr const char* kChunkMagic = "SKFB2";  // 0.1.0 wrote SKFB1 with a different parameter set: not read
@@ -271,16 +273,23 @@ void formatSound(int id, float n, bool harmonicLock, char* out, size_t len) {
 
 // ---- Plugin instance ------------------------------------------------------------------------------------
 constexpr int kHoldFrames = 5292;  // a pressed button stays lit for ~120 ms, then the host hears it go back to 0
+constexpr int kMaxNotify = 8;      // parameter changes reported to the host per block (a preset load spreads out)
+constexpr float kFadeSeconds = 0.03f;
+constexpr int kScratch = 256;      // frames processed per core call
 
 struct Plugin {
     AEffect fx;
     audioMasterCallback master = nullptr;
-    sk::ShermanCore core;
+    sk::ShermanCore core;                     // the sound
+    sk::ShermanCore fading;                   // the sound before a preset load, while it fades out
+    int fadeLeft = 0, fadeLength = 1323;      // crossfade frames to go / in all (audio thread)
+    float fadeStep = 1.f / 1323.f;            // 1 / fadeLength
     std::atomic<float> norm[kNumSound];       // the sound; written by the host's UI/automation thread
     std::atomic<float> pressed[kNumVst];      // momentary buttons: 1 while lit
     std::atomic<int> holdFrames[kNumVst];     // frames until a lit button is reported back to 0
     std::atomic<uint8_t> dirty[kNumVst];      // the host must hear this parameter's new value (preset loads)
     std::atomic<bool> snap{false};            // a chunk was loaded: jump to it instead of gliding
+    std::atomic<bool> presetLoaded{false};    // a preset was loaded: crossfade to it
     std::atomic<bool> trigRequest{false};     // TRIG pressed: fire the envelope on the audio thread
     std::atomic<bool> updateDisplay{false};
     std::atomic<int> cursor{0};               // the preset selected on the PRESETS page
@@ -289,6 +298,7 @@ struct Plugin {
     char presetDir[600] = {};
     char status[64] = {};
     char chunk[kNumSound * 28 + 64] = {};
+    float scratch[4][kScratch] = {};          // new sound L/R, old sound L/R
 
     Plugin() {
         for (int i = 0; i < kNumSound; ++i) norm[i].store(sk::kDefaults[i], std::memory_order_relaxed);
@@ -306,36 +316,6 @@ void setStatus(Plugin* p, const char* fmt, const char* arg) {
     std::snprintf(p->status, sizeof p->status, fmt, arg);
     p->updateDisplay.store(true, std::memory_order_relaxed);
 }
-
-// Flush denormals to zero while we process (the VFP/SSE default keeps them, and a decaying filter tail full of
-// denormals is slow on ARM). Restores the host's mode on the way out.
-struct ScopedFlushDenormals {
-#if defined(__arm__) && defined(__ARM_FP)
-    uint32_t saved;
-    ScopedFlushDenormals() {
-        asm volatile("vmrs %0, fpscr" : "=r"(saved));
-        const uint32_t fz = saved | (1u << 24);
-        asm volatile("vmsr fpscr, %0" : : "r"(fz));
-    }
-    ~ScopedFlushDenormals() { asm volatile("vmsr fpscr, %0" : : "r"(saved)); }
-#elif defined(__aarch64__)
-    uint64_t saved;
-    ScopedFlushDenormals() {
-        asm volatile("mrs %0, fpcr" : "=r"(saved));
-        const uint64_t fz = saved | (1ull << 24);
-        asm volatile("msr fpcr, %0" : : "r"(fz));
-    }
-    ~ScopedFlushDenormals() { asm volatile("msr fpcr, %0" : : "r"(saved)); }
-#elif defined(__SSE__) || defined(__x86_64__)
-    uint32_t saved;
-    ScopedFlushDenormals() {
-        asm volatile("stmxcsr %0" : "=m"(saved));
-        uint32_t ftz = saved | 0x8040u;  // FTZ | DAZ
-        asm volatile("ldmxcsr %0" : : "m"(ftz));
-    }
-    ~ScopedFlushDenormals() { asm volatile("ldmxcsr %0" : : "m"(saved)); }
-#endif
-};
 
 // ---- Preset files ---------------------------------------------------------------------------------------
 // The folder this .so was loaded from, read from /proc/self/maps (dladdr would need GLIBC_2.34 when built with
@@ -475,6 +455,7 @@ bool loadPreset(Plugin* p, int index) {
     p->program.store(index, std::memory_order_relaxed);
     p->cursor.store(index, std::memory_order_relaxed);
     p->dirty[kPresetIdx].store(1, std::memory_order_relaxed);
+    p->presetLoaded.store(true, std::memory_order_release);  // after the values: the audio thread sees them all
     setStatus(p, "Loaded %s", name);
     return true;
 }
@@ -532,7 +513,9 @@ void syncParams(Plugin* p) {
 float getParameter(AEffect* e, int32_t i);
 
 // Tell the host what changed on our side: buttons going back to 0, knobs moved by a preset. Called from
-// processReplacing, never from inside a host call (the host may call setParameter back from in here).
+// processReplacing, never from inside a host call (the host may call setParameter back from in here). At most
+// kMaxNotify parameter changes per block, so a preset load doesn't hit the host with 30 calls in one block; the
+// display refresh goes out once the last of them has.
 void notifyHost(Plugin* p, int32_t frames) {
     if (!p->master) return;
     bool any = false;
@@ -544,40 +527,85 @@ void notifyHost(Plugin* p, int32_t frames) {
             p->master(&p->fx, audioMasterAutomate, i, 0, nullptr, 0.f);
             any = true;
         }
-        if (p->dirty[i].exchange(0, std::memory_order_relaxed)) {
-            p->master(&p->fx, audioMasterAutomate, i, 0, nullptr, getParameter(&p->fx, i));
-            any = true;
-        }
     }
+    int sent = 0;
+    bool more = false;
+    for (int i = 0; i < kNumVst; ++i) {
+        if (!p->dirty[i].load(std::memory_order_relaxed)) continue;
+        if (sent == kMaxNotify) {
+            more = true;
+            break;
+        }
+        if (!p->dirty[i].exchange(0, std::memory_order_relaxed)) continue;  // atomic: a flag set meanwhile survives
+        p->master(&p->fx, audioMasterAutomate, i, 0, nullptr, getParameter(&p->fx, i));
+        ++sent;
+        any = true;
+    }
+    if (more) return;  // the display refresh waits for the rest
     if (p->updateDisplay.exchange(false, std::memory_order_relaxed) || any)
         p->master(&p->fx, audioMasterUpdateDisplay, 0, 0, nullptr, 0.f);
 }
 
-constexpr int kScratch = 256;
 float gSilence[kScratch];  // zero-initialised; stands in for missing input buffers
+
+// Smoothstep from 0 to 1 over the crossfade.
+float fadeGain(int left, float step) {
+    const float t = 1.f - static_cast<float>(left) * step;
+    return t * t * (3.f - 2.f * t);
+}
 
 // Process n frames from in to out (out may alias in). accumulate: VST2's legacy process(), which adds.
 void run(AEffect* e, float** in, float** out, int32_t n, bool accumulate) {
     Plugin* p = self(e);
     if (!out || !out[0] || n <= 0) return;
     {
-        ScopedFlushDenormals ftz;
+        sk::ScopedFlushDenormals ftz;
+        // Acquire first: a chunk or preset stores all its values before raising its flag.
+        const bool snap = p->snap.exchange(false, std::memory_order_acquire);
+        // A preset load crossfades: the old sound carries on from exactly where it is in `fading`, the current
+        // core jumps to the new values (unheard: its gain starts at 0). One that comes in while a fade is still
+        // running waits for it to finish (meanwhile the current core glides towards it).
+        const bool preset = p->fadeLeft == 0 && p->presetLoaded.exchange(false, std::memory_order_acquire);
+        if (preset && !snap) {
+            p->fading = p->core;
+            p->fadeLeft = p->fadeLength;
+        }
         syncParams(p);
-        if (p->snap.exchange(false, std::memory_order_relaxed)) p->core.snapParams();
-        if (p->trigRequest.exchange(false, std::memory_order_relaxed)) p->core.trigger();
+        if (snap) {
+            p->fadeLeft = 0;  // a project load replaces everything at once
+            p->presetLoaded.store(false, std::memory_order_relaxed);
+        }
+        if (snap || preset) p->core.snapParams();
+        if (p->trigRequest.exchange(false, std::memory_order_relaxed)) {
+            p->core.trigger();
+            if (p->fadeLeft > 0) p->fading.trigger();
+        }
         float* outR = out[1];
+        float* l = p->scratch[0];
+        float* r = p->scratch[1];
         for (int32_t off = 0; off < n;) {
             const int32_t len = n - off < kScratch ? n - off : kScratch;
             const float* inL = in && in[0] ? in[0] + off : gSilence;
             const float* inR = in && in[1] ? in[1] + off : inL;
-            if (!accumulate) {
-                p->core.process(inL, inR, out[0] + off, outR ? outR + off : nullptr, static_cast<uint32_t>(len));
-            } else {
-                float l[kScratch], r[kScratch];
-                p->core.process(inL, inR, l, r, static_cast<uint32_t>(len));
+            // Into scratch first: out may be the input buffer, and a crossfade reads the input twice.
+            p->core.process(inL, inR, l, r, static_cast<uint32_t>(len));
+            if (p->fadeLeft > 0) {
+                float* fl = p->scratch[2];
+                float* fr = p->scratch[3];
+                p->fading.process(inL, inR, fl, fr, static_cast<uint32_t>(len));
                 for (int32_t i = 0; i < len; ++i) {
+                    const float g = p->fadeLeft > 0 ? fadeGain(p->fadeLeft--, p->fadeStep) : 1.f;
+                    l[i] = fl[i] + g * (l[i] - fl[i]);
+                    r[i] = fr[i] + g * (r[i] - fr[i]);
+                }
+            }
+            for (int32_t i = 0; i < len; ++i) {
+                if (accumulate) {
                     out[0][off + i] += l[i];
                     if (outR) outR[off + i] += r[i];
+                } else {
+                    out[0][off + i] = l[i];
+                    if (outR) outR[off + i] = r[i];
                 }
             }
             off += len;
@@ -709,12 +737,22 @@ intptr_t dispatcher(AEffect* e, int32_t op, int32_t idx, intptr_t v, void* ptr, 
             copyStr(ptr, name, 24);
             return 1;
         }
-        case effSetSampleRate: p->core.prepare(opt > 0.f ? opt : 44100.f); return 1;
+        case effSetSampleRate: {
+            const float fs = opt > 0.f ? opt : 44100.f;
+            p->core.prepare(fs);
+            p->fading.prepare(fs);
+            p->fadeLength = static_cast<int>(kFadeSeconds * fs) > 0 ? static_cast<int>(kFadeSeconds * fs) : 1;
+            p->fadeStep = 1.f / static_cast<float>(p->fadeLength);
+            p->fadeLeft = 0;
+            return 1;
+        }
         case effSetBlockSize: return 1;
         case effMainsChanged:
             if (v) {  // resume: start from silence with the current settings
                 syncParams(p);
                 p->core.reset();
+                p->fadeLeft = 0;
+                p->presetLoaded.store(false, std::memory_order_relaxed);
             }
             return 1;
         case effGetChunk: {
@@ -731,7 +769,7 @@ intptr_t dispatcher(AEffect* e, int32_t op, int32_t idx, intptr_t v, void* ptr, 
             for (int i = 0; i < kNumSound; ++i) p->norm[i].store(values[i], std::memory_order_relaxed);
             p->program.store(program, std::memory_order_relaxed);
             p->cursor.store(program, std::memory_order_relaxed);
-            p->snap.store(true, std::memory_order_relaxed);
+            p->snap.store(true, std::memory_order_release);  // after the values: the audio thread sees them all
             return 1;
         }
         case effCanDo: return -1;       // no MIDI, no host bypass, nothing optional
@@ -748,6 +786,7 @@ extern "C" __attribute__((visibility("default"))) void* VSTPluginMain(void* host
     Plugin* p = new (mem) Plugin;
     p->master = reinterpret_cast<audioMasterCallback>(hostCallback);
     p->core.prepare(44100.0);  // MPC OS runs at 44.1 kHz; effSetSampleRate overrides it
+    p->fading.prepare(44100.0);
     const char* override = std::getenv("SKFB_PRESET_DIR");
     char dir[512];
     if (override && *override) std::snprintf(p->presetDir, sizeof p->presetDir, "%s", override);

@@ -213,8 +213,11 @@ int main(int argc, char** argv) {
           "picking Acid Squelch loads it (status \"%s\")", display(a, kStatus).c_str());
     CHECK(gAutomated.empty(), "nothing is sent to the host from inside its own effSetProgram call");
     idle(a, 1);
-    CHECK(gAutomated.size() >= size_t(kNumSound) && gUpdates > 0, "next block: the host hears %zu parameter changes + a display update",
-          gAutomated.size());
+    const size_t firstBlock = gAutomated.size();
+    const int updatesFirst = gUpdates;
+    idle(a, 4);
+    CHECK(firstBlock == 8 && updatesFirst == 0 && gAutomated.size() >= size_t(kNumSound) && gUpdates == 1,
+          "the host hears the %zu changes 8 per block, then one display update", gAutomated.size());
     a->setParameter(a, sk::kReso1, 0.5f);
     a->dispatcher(a, 2, 0, 1, nullptr, 0);  // the same program again
     CHECK(std::fabs(a->getParameter(a, sk::kReso1) - 0.5f) < 1e-6f, "re-picking the current program keeps the tweaks");
@@ -303,6 +306,33 @@ int main(int argc, char** argv) {
         auto out = run(b, sine(1000, 0.05f, 1024));
         const double g = 20 * std::log10(rms(out, 512) / rms(sine(1000, 0.05f, 1024), 512));
         CHECK(std::fabs(g) < 0.5, "a loaded chunk takes effect at once (%.2f dB after 12 ms)", g);
+    }
+    {   // A preset picked mid-note crossfades from the old sound (30 ms): the 2 ms after the switch step no more than
+        // the old sound did before it. A second pick during the fade waits for it, then lands too.
+        setClean(a);
+        a->setParameter(a, sk::kFreq1, hzToParam(300));
+        a->setParameter(a, sk::kReso1, 0.8f);
+        a->dispatcher(a, 12, 0, 1, nullptr, 0);
+        auto l = sine(220, 0.3f, 128 * 120), r = l;
+        const size_t at = 128 * 50, second = at + 256;
+        for (size_t i = 0; i < l.size(); i += 128) {
+            if (i == at) a->dispatcher(a, 2, 0, 7, nullptr, 0);       // Screaming Ring
+            if (i == second) a->dispatcher(a, 2, 0, 6, nullptr, 0);   // Drum Crusher, while the first fade runs
+            float* io[2] = {&l[i], &r[i]};
+            a->processReplacing(a, io, io, 128);
+        }
+        double before = 0, after = 0;
+        bool finite = true;
+        for (size_t i = 1; i < l.size(); ++i) {
+            const double step = std::fabs(l[i] - l[i - 1]);
+            if (i >= at - 2205 && i < at) before = std::max(before, step);
+            if (i >= at && i < at + 88) after = std::max(after, step);
+            finite &= std::isfinite(l[i]);
+        }
+        CHECK(after < 1.5 * before, "a preset picked mid-note crossfades: no click (step ratio %.2f)", after / before);
+        CHECK(finite && a->dispatcher(a, 3, 0, 0, nullptr, 0) == 6 &&
+              std::fabs(a->getParameter(a, sk::kInput) - (0.5f + 28.f / 80.f)) < 1e-6f,
+              "a second pick during the fade lands after it (program %ld)", static_cast<long>(a->dispatcher(a, 3, 0, 0, nullptr, 0)));
     }
 
     const size_t n = 44100, skip = n / 4;

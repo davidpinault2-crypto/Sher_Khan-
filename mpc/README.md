@@ -23,13 +23,13 @@ its own font, using the plugin's parameter names, for example "LFO Speed".*
 
 ## Install
 
-1. Download `dist/SK-Filterbank-0.2.0-mpc-armv7.zip` from this repo.
+1. Download `dist/SK-Filterbank-0.3.0-mpc-armv7.zip` from this repo.
 2. **Save your project.** The installer stops MPC and starts it again.
 3. Copy the zip to the Force and run the installer:
    ```sh
-   scp SK-Filterbank-0.2.0-mpc-armv7.zip root@<force-ip>:/tmp/
+   scp SK-Filterbank-0.3.0-mpc-armv7.zip root@<force-ip>:/tmp/
    ssh root@<force-ip>
-   cd /tmp && unzip -o SK-Filterbank-0.2.0-mpc-armv7.zip && sh SK-Filterbank-0.2.0/install.sh
+   cd /tmp && unzip -o SK-Filterbank-0.3.0-mpc-armv7.zip && sh SK-Filterbank-0.3.0/install.sh
    ```
    The installer is the toolkit's tested one:
    - It checks the device and stops MPC (the `acvs` or `inmusic-mpc` service).
@@ -42,8 +42,8 @@ its own font, using the plugin's parameter names, for example "LFO Speed".*
 4. On the Force, add **SK Filterbank** (manufacturer *Sher Khan*) to a track's insert effects from the plugin effects.
    The FILTERS / MODULATION / PRESETS tabs at the bottom switch pages, and the Q-Links follow the page.
 
-Upgrading from 0.1.0: the controls changed completely, so a project saved with 0.1.0 opens with this plugin at its
-Init sound.
+Upgrading from 0.2.0: projects and User presets carry over unchanged (same controls, same saved state). Upgrading
+from 0.1.0: the controls changed completely, so a project saved with 0.1.0 opens with this plugin at its Init sound.
 
 Install on the internal drive (the default). A Force SSD is usually mounted `noexec`. MPC then lists the plugin but can
 only show "Load Plugin", because it can't load code from that drive.
@@ -54,7 +54,7 @@ If you use MockbaMod's VST scanner (`vstscanner.sh`), it rebuilds the plugin lis
 ### Uninstall
 
 ```sh
-ssh root@<force-ip> sh /tmp/SK-Filterbank-0.2.0/uninstall.sh
+ssh root@<force-ip> sh /tmp/SK-Filterbank-0.3.0/uninstall.sh
 ```
 (If `/tmp` was cleared by a reboot, copy and unzip the package again first.) This stops MPC, removes the plugin and its
 plugin-list entry (after a backup), and starts MPC. Your `presets/` folder is kept. Projects that used the plugin open
@@ -69,6 +69,8 @@ without it.
 - **MPC's PRESET menu** lists the 12 factory sounds and the 16 User slots. Picking one loads it. Picking the one that
   is already selected does nothing (that's what protects a project's tweaks), so to go back to a preset after
   tweaking it, press LOAD on the PRESETS page.
+- **During playback**, a preset (from the menu or LOAD) crossfades from the old sound to the new one in 30 ms. If you
+  pick another one within those 30 ms, it follows straight after. A project load still applies at once.
 - **PRESETS page:**
   - The arrows (or Q-Link 1) pick a preset, and **LOAD** recalls it.
   - **SAVE** stores the current sound in the selected User slot. Factory presets are read-only, and the status line
@@ -79,6 +81,31 @@ without it.
 
 Factory presets: Init, Acid Squelch, Funk Follower, Twin Notch Sweep, Stereo Wobble, Vowel Bank, Drum Crusher,
 Screaming Ring, Audio FM Growl, Sub Rumble, Harmonic Pluck, Slow Motion.
+
+## What's new in 0.3.0
+
+The controls and the saved state are the same as in 0.2.0. The work went into CPU and into how changes sound while
+the music plays.
+
+- **Less CPU.**
+  - Counted instruction by instruction on the ARM build under emulation, one 128-frame block takes 220,000
+    instructions with NEON (the Force's processor has it). 0.2.0 took 513,000, so that is 57% fewer.
+  - Without NEON it takes 310,000 (40% fewer).
+  - With NEON the audio path makes no divisions (0.2.0 made 46 per sample; the plain path makes 10). It makes no
+    math-library calls either, except on rare large steps of the overdrive (0.2.0 made at least four per sample).
+    Both are slow on the Force's processor.
+  - None of this is timed on a Force yet; run the bench below.
+- **No clicks from switches.**
+  - Switching LIMIT, HARMONICS (free/locked), LFO F2 or the LFO shape while the music plays used to jump by 8 to 16
+    times the signal's normal step. Now it stays within 1 to 2 times (the tests check it).
+  - A SINE TRIG restart now glides for 2 ms instead of jumping.
+- **Smooth preset changes.** See above: a 30 ms crossfade instead of every knob sweeping to its new value.
+- **Smoother knobs.** Freq 1/2 and the harmonic ratio glide over 30 ms (the other knobs over 15 ms). A Q-Link
+  turned slowly sweeps instead of stepping.
+- **Three small sound changes.**
+  - The output safety limiter is exactly linear up to 0 dBFS. 0.2.0's took 0.16 dB off a full-scale signal.
+  - With LIMIT on, AM and the clock bleed sound the same as with it off.
+  - Aliasing at high drive dropped a little (-76 instead of -71 dBc at +30 dB).
 
 ## The controls
 
@@ -130,11 +157,11 @@ The plugin reports 36 samples (0.8 ms) of latency. That is the 4x oversampling f
 
 | Check | Result |
 |---|---|
-| DSP tests (`make test`) | 38/38: unity at noon, filter slopes, notch from the Correction knob, resonance, filter 2 self-oscillation, harmonic lock, Par/Ser, Hi Cut/Boost, ADSR/AR/follower, SensiTrig, TRIG, LFO rate, AM and FM sidebands, grit, aliasing, NaN safety, stress |
-| VST2 host test, x86 and the **real ARM binary under qemu-arm** | 49/49: parameters and value texts, Q-Link nudges on switches, the PRESET menu, user preset save/load, buttons springing back, the project chunk with the preset, chunk-load jumps, in-place buffers, presets folder found next to the `.so` |
+| DSP tests (`make test`, and on the ARM build under qemu-arm) | 44/44: unity at noon, filter slopes, notch from the Correction knob, resonance, filter 2 self-oscillation, harmonic lock, Par/Ser, Hi Cut/Boost, ADSR/AR/follower, SensiTrig, TRIG, LFO rate, AM and FM sidebands, grit, aliasing, no clicks from switches and knobs, NaN safety, stress. On ARM, NEON and the plain path agree to -116 dB |
+| VST2 host test, x86 and the **real ARM binary under qemu-arm** (with and without NEON) | 51/51: parameters and value texts, Q-Link nudges on switches, the PRESET menu, user preset save/load, buttons springing back, the project chunk with the preset, chunk-load jumps, a mid-note preset crossfade without a click, host updates spread over blocks, in-place buffers, presets folder found next to the `.so` |
 | Binary | armv7 hard-float, exports only `VSTPluginMain`, needs only libc/libm, highest glibc symbol 2.29 (the Force has 2.39) |
 | Installer | install, upgrade and uninstall under BusyBox 1.36.1 (the Force's version) against a mock `MPC.settings`: one entry, other plugins untouched, User presets kept on upgrade and uninstall |
-| CPU | About 60 µs per 128-frame block on an x86 VM (2% of the block). **Not measured on a Force.** Expect roughly 3x that on its Cortex-A17 |
+| CPU | ARM instructions per 128-frame block (counted under qemu): 220k with NEON, 310k without, against 513k for 0.2.0. On an x86 VM the toolkit's bench idles at 2.5% of a block (0.2.0: 3.3%). **Not timed on a Force** |
 
 **Not verified:**
 - Loading on a real Force.
@@ -146,8 +173,13 @@ The plugin reports 36 samples (0.8 ms) of latency. That is the 4x oversampling f
 Please run the device CPU check before relying on several instances:
 
 ```sh
-MPC_VST=../mpc-vst-plugins mpc/bench.sh <force-ip> -p    # PASS / WARN / FAIL, nothing is installed
+MPC_VST=../mpc-vst-plugins mpc/bench.sh <force-ip>       # PASS / WARN / FAIL, nothing is installed
 ```
+
+Read its "idle" and "audio in" rows for the plugin's own cost. Its sweep rows set random parameters every block,
+including LOAD and SAVE. So they also time preset files being written and read, and preset crossfades, where two
+sounds run side by side. On MPC those buttons are pressed from the screen, not on the audio thread, and only now and
+then.
 
 ## Troubleshooting
 
@@ -166,7 +198,7 @@ MPC_VST=../mpc-vst-plugins mpc/bench.sh <force-ip> -p    # PASS / WARN / FAIL, n
 sudo apt install g++-arm-linux-gnueabihf qemu-user python3-pil   # Debian/Ubuntu
 git clone https://github.com/sd88me/mpc-vst-plugins ../mpc-vst-plugins
 git -C ../mpc-vst-plugins checkout 3a54b72cd172c840881b0be4f887653cc0829bf0
-mpc/build.sh 0.2.0          # tests, Force build, binary checks, skin, dist/SK-Filterbank-0.2.0-mpc-armv7.zip
+mpc/build.sh 0.3.0          # tests (x86 and ARM), Force build, binary checks, skin, dist/SK-Filterbank-0.3.0-mpc-armv7.zip
 ```
 
 Files:

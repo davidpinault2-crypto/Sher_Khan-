@@ -7,7 +7,21 @@ saved with the project, it has factory and user presets, and it installs with ro
 **[mpc/README.md](mpc/README.md)** to install it. The same DSP core also builds as an LV2 plugin for desktop
 listening tests.
 
-**Download for the Force:** [`dist/SK-Filterbank-0.2.0-mpc-armv7.zip`](dist/SK-Filterbank-0.2.0-mpc-armv7.zip)
+**Download for the Force:** [`dist/SK-Filterbank-0.3.0-mpc-armv7.zip`](dist/SK-Filterbank-0.3.0-mpc-armv7.zip)
+
+**New in 0.3.0:** less CPU and smoother operation, with the same controls. The sound changes in three details:
+- The output safety limiter is now exactly linear up to 0 dBFS (0.2.0's took 0.16 dB off a full-scale signal).
+- With LIMIT on, AM and the clock bleed sound the same as with it off.
+- The cutoff knobs glide over 30 ms instead of 15.
+
+The other changes:
+- **CPU.** With NEON, which the Force's processor has, it runs 57% fewer instructions per block than 0.2.0. That is
+  counted on the ARM build under emulation, not yet timed on a Force. The audio path makes no divisions (0.2.0 made
+  46 per sample) and normally no math-library calls (0.2.0 made at least four per sample).
+- **Switches.** LIMIT, HARMONICS, LFO F2 and the LFO shape no longer click when you switch them during playback.
+- **Presets.** Picking a preset during playback crossfades from the old sound to the new one in 30 ms.
+
+Projects and User presets from 0.2.0 load unchanged. See [mpc/README.md](mpc/README.md#whats-new-in-030).
 
 ## Read this first
 
@@ -27,7 +41,7 @@ listening tests.
 in ─► INPUT gain (-30..+40 dB, unity at noon) ─► Hi Cut/Flat/Hi Boost ─► overdrive (asymmetric soft clip, ADAA)
    ─► [switched-cap sampling @ 50 x fc] ─► FILTER 1 (L-B-H morph + Correction) ─┐
    ─► PAR/SER blend: parallel (1 + 2) ... serial (1 into 2) ─► FILTER 2 ────────┴─► AM (by filter 2's output)
-   ─► safety limiter (+12 dBFS) ─► DC block ─► OUTPUT ─► BYP/EFF with the latency-matched dry signal
+   ─► safety limiter (linear to 0 dBFS, soft up to +12 dBFS) ─► DC block ─► OUTPUT ─► BYP/EFF with the latency-matched dry signal
 cutoffs = FREQ + ADSR depth x envelope + LFO (filter 2 in or out of phase) + FM (the input audio);
 HARMONICS can lock filter 2 to filter 1 at a fixed ratio.
 envelope = ADSR / AR / follower, triggered by the level after INPUT (SENSITRIG = twice as sensitive), or TRIG
@@ -44,13 +58,27 @@ Everything between the overdrive and the limiter runs **4x oversampled** through
 | Correction knob | Adds band-pass (left) or LP + HP - BP (right), so band-pass mode becomes a notch |
 
 Measured (see `tests/test_core.cpp`): the passband is flat to within 0.1 dB, and with both filters open 10 kHz is within
-0.3 dB. Worst alias below 16 kHz on a 3.7 kHz tone is -71 dBc at +30 dB input and -55 dBc at +40 dB.
+0.3 dB. Worst alias below 16 kHz on a 3.7 kHz tone is -76 dBc at +30 dB input and -56 dBc at +40 dB.
+
+| Smooth operation | How |
+|---|---|
+| Knobs | Every value glides: the cutoffs and the harmonic ratio over 30 ms, everything else over 15 ms |
+| LIMIT | Rescales the filters' internal state with the level, so the output doesn't jump |
+| HARMONICS, LFO F2 | Crossfade between free and locked, same and inverted (15 ms) |
+| LFO shape, SINE TRIG | A new shape glides in over 30 ms; a restart glides over 2 ms instead of jumping |
+| Presets | The old and the new sound run side by side for a 30 ms crossfade (twice the CPU for that moment) |
+
+| CPU | How |
+|---|---|
+| No divisions, (almost) no libm on the audio path | The cutoff comes from a compile-time table. The divisions that remain share one reciprocal (Montgomery's trick), and the output limiter needs none below 0 dBFS. Glides are linear ramps per 32 samples that cost nothing once settled. |
+| NEON, picked at load time | The FIRs run four taps at a time, the overdrive four oversampled steps at a time, and the two filters both channels at a time. Without NEON (or with `SK_NO_NEON=1`) the plain path runs; the two agree to -116 dB. |
 
 ## Build and test
 
 ```sh
-make && make test        # LV2 bundle, x86 VST2 build; DSP tests (38) + VST2 host test (49)
-make force test-force    # the Force binary (arm-linux-gnueabihf-g++) and the host test under qemu-arm
+make && make test        # LV2 bundle, x86 VST2 build; DSP tests (44) + VST2 host test (51)
+make force test-force    # the Force binary (arm-linux-gnueabihf-g++); under qemu-arm the DSP tests on the NEON path
+                         # (including NEON vs plain) and the host test with and without NEON
 mpc/build.sh             # everything above + skin + installer zip (needs the mpc-vst-plugins checkout, see mpc/README.md)
 ```
 

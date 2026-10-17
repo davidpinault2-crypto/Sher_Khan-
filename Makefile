@@ -1,7 +1,8 @@
 # Desktop:  make            LV2 bundle + an x86 build of the VST2 plugin (for the host test)
 #           make test       DSP tests and the VST2 host test (x86)
 # Force:    make force      the MPC OS plugin, armv7 hard-float (needs arm-linux-gnueabihf-g++)
-#           make test-force the same host test, cross-built, against the Force .so under qemu-arm
+#           make test-force the DSP tests and the host test, cross-built, against the Force .so under qemu-arm
+#                           (the host test twice: with NEON, as on the Force, and the plain path)
 # Packaging the Force plugin (skin, installer, zip) is mpc/build.sh.
 CXX      ?= g++
 ARMCXX   ?= arm-linux-gnueabihf-g++
@@ -49,8 +50,14 @@ build/armhf/test_vst: tests/test_vst.cpp dsp/ShermanCore.h
 	@mkdir -p $(@D)
 	$(ARMCXX) $(CXXFLAGS) $(ARMFLAGS) -o $@ $< -ldl
 
-test-force: build/armhf/$(SO) build/armhf/test_vst
+build/armhf/test_core: tests/test_core.cpp dsp/ShermanCore.h
+	@mkdir -p $(@D)
+	$(ARMCXX) $(CXXFLAGS) $(ARMFLAGS) -o $@ $<
+
+test-force: build/armhf/$(SO) build/armhf/test_vst build/armhf/test_core
+	$(QEMU) -L /usr/arm-linux-gnueabihf ./build/armhf/test_core
 	$(QEMU) -L /usr/arm-linux-gnueabihf ./build/armhf/test_vst build/armhf/$(SO)
+	SK_NO_NEON=1 $(QEMU) -L /usr/arm-linux-gnueabihf ./build/armhf/test_vst build/armhf/$(SO)
 
 clean:
 	rm -rf build $(BUNDLE)/sherkhan.so

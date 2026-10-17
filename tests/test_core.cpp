@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <random>
 #include <utility>
@@ -20,6 +21,7 @@ void check(bool ok, const char* what, double value) {
 }
 
 float hzToParam(float hz) { return std::log2(hz / 20.f) / sk::kOctaves; }
+float lfoDepthParam(float oct) { return (oct + 4.f) / 8.f; }  // inverse of map::lfoOct
 float dbToInput(float db) { return db < 0.f ? (db + 30.f) / 60.f : 0.5f + db / 80.f; }  // inverse of map::inputDb
 float opt(int i, int count) { return static_cast<float>(i) / (count - 1); }
 
@@ -106,6 +108,50 @@ std::vector<float> envelopeTrace(sk::ShermanCore& c, const std::vector<float>& i
         trace.push_back(c.envelope());
     }
     return trace;
+}
+
+// A change made mid-note, as the host makes it (between blocks of 64): the biggest sample-to-sample step of the
+// output in the 10 ms after it, over the biggest in the 50 ms before. A click is a jump far beyond the signal's
+// own steps; a glide stays near 1.
+double clickRatio(const Settings& base, const Settings& change, double hz = 220) {
+    sk::ShermanCore c;
+    configure(c, clean(base));
+    const size_t n = 44096, at = 22016;
+    auto l = sine(hz, 0.3f, n);
+    auto r = l;
+    for (size_t i = 0; i < n; i += 64) {
+        if (i == at) {
+            for (auto& [id, v] : change) c.setParam(id, v);
+            if (change.empty()) c.trigger();
+        }
+        c.process(&l[i], &r[i], &l[i], &r[i], 64);
+    }
+    auto maxStep = [&](size_t a, size_t b) {
+        double m = 0;
+        for (size_t i = a; i < b; ++i) m = std::max(m, double(std::fabs(l[i] - l[i - 1])));
+        return m;
+    };
+    return maxStep(at, at + 441) / (maxStep(at - 2205, at) + 1e-12);
+}
+
+// The LFO's biggest per-sample step across a change made after 50 ms (processed one sample at a time), and its
+// value 20 ms after the change.
+std::pair<double, double> lfoJump(const Settings& base, const Settings& change) {
+    sk::ShermanCore c;
+    configure(c, clean(base));
+    float l = 0, r = 0, prev = 0, worst = 0, after = 0;
+    for (int i = 0; i < 4410; ++i) {
+        if (i == 2205) {
+            for (auto& [id, v] : change) c.setParam(id, v);
+            if (change.empty()) c.trigger();
+        }
+        l = r = 0.f;
+        c.process(&l, &r, &l, &r, 1);
+        if (i > 2000) worst = std::max(worst, std::fabs(c.lfo() - prev));
+        if (i == 2205 + 882) after = c.lfo();
+        prev = c.lfo();
+    }
+    return {worst, after};
 }
 
 }  // namespace
@@ -304,6 +350,68 @@ int main() {
             else check(worst < -50, "Input +40 dB: worst alias below 16kHz (dBc) < -50", worst);
         }
     }
+    {   // Switches and knobs change without clicks (0.2.0 jumped by 8-16x on LIMIT, HARMONICS and LFO F2).
+        const Settings reso = {{sk::kInput, dbToInput(10)}, {sk::kFreq1, hzToParam(800)}, {sk::kReso1, 0.8f}};
+        Settings limited = reso;
+        limited.push_back({sk::kTrigMode, opt(sk::kLimit, 3)});
+        const double on = clickRatio(reso, {{sk::kTrigMode, opt(sk::kLimit, 3)}});
+        const double off = clickRatio(limited, {{sk::kTrigMode, opt(sk::kNormal, 3)}});
+        check(on < 1.5 && off < 1.5, "LIMIT on/off mid-note: no click (step ratio)", std::max(on, off));
+        const Settings bp2 = {{sk::kFreq1, hzToParam(1000)}, {sk::kFreq2, hzToParam(4000)}, {sk::kLbh2, 0.5f}, {sk::kReso2, 0.6f}};
+        Settings locked = bp2;
+        locked.push_back({sk::kHarmonics, opt(3, 12)});
+        const double lock = clickRatio(bp2, {{sk::kHarmonics, opt(3, 12)}});
+        const double unlock = clickRatio(locked, {{sk::kHarmonics, 0.f}});
+        check(lock < 2.5 && unlock < 2.5, "HARMONICS lock/unlock: crossfades, no click", std::max(lock, unlock));
+        const Settings wobble = {{sk::kLfoDepth, lfoDepthParam(3)}, {sk::kLfoSpeed, 0.2f}, {sk::kParSer, 0.f},
+                                 {sk::kFreq2, hzToParam(800)}, {sk::kReso2, 0.5f}, {sk::kLbh2, 0.5f}};
+        const double flip = clickRatio(wobble, {{sk::kLfoF2, 1.f}});
+        check(flip < 1.5, "LFO F2 inverted mid-note: no click", flip);
+        const Settings sweep = {{sk::kLfoDepth, lfoDepthParam(3)}, {sk::kLfoSpeed, 0.2f}, {sk::kFreq1, hzToParam(800)},
+                                {sk::kReso1, 0.5f}, {sk::kLbh1, 0.5f}};
+        const double shapeLfo = lfoJump(sweep, {{sk::kLfoShape, opt(sk::kSaw, 3)}}).first;
+        const double shapeOut = clickRatio(sweep, {{sk::kLfoShape, opt(sk::kSaw, 3)}});
+        check(shapeLfo < 0.01 && shapeOut < 3, "LFO shape sine -> saw glides (biggest LFO step)", shapeLfo);
+        // At 7.07 Hz the LFO is at 0.81 when TRIG restarts it 50 ms in; 20 ms later it reads sin(2 pi 7.07 0.02) =
+        // 0.78 (it would be near 0.03 without the restart).
+        Settings trig = sweep;
+        trig.push_back({sk::kLfoShape, opt(sk::kSineTrig, 3)});
+        trig.push_back({sk::kLfoSpeed, 0.5f});
+        const auto [restartStep, restartAfter] = lfoJump(trig, {});
+        check(restartStep < 0.05 && std::fabs(restartAfter - 0.776) < 0.05,
+              "SINE TRIG restart: restarts, no jump in the LFO (biggest step)", restartStep);
+        const double knob = clickRatio({{sk::kFreq1, hzToParam(200)}, {sk::kReso1, 0.7f}}, {{sk::kFreq1, hzToParam(5000)}});
+        const double blend = clickRatio({{sk::kFreq1, hzToParam(500)}, {sk::kFreq2, hzToParam(3000)}, {sk::kReso2, 0.5f}},
+                                        {{sk::kParSer, 0.f}});
+        const double mix = clickRatio({{sk::kFreq1, hzToParam(300)}}, {{sk::kBypEff, 0.f}});
+        check(knob < 2 && blend < 1.5 && mix < 1.5, "Freq jump, Par/Ser and Byp/Eff glide (worst step ratio)",
+              std::max({knob, blend, mix}));
+    }
+#if SK_NEON
+    {   // On ARM: the NEON path (picked at load time) and the plain one agree to rounding.
+        unsetenv("SK_NO_NEON");
+        sk::ShermanCore a;
+        setenv("SK_NO_NEON", "1", 1);
+        sk::ShermanCore b;
+        unsetenv("SK_NO_NEON");
+        const Settings p = clean({{sk::kInput, dbToInput(10)}, {sk::kFm, 0.4f}, {sk::kGrit, 1.f}, {sk::kFreq1, hzToParam(300)},
+                                  {sk::kReso1, 0.8f}, {sk::kFreq2, hzToParam(330)}, {sk::kReso2, 1.f}, {sk::kAm, 0.5f},
+                                  {sk::kParSer, 0.4f}, {sk::kTrigMode, opt(sk::kLimit, 3)}});
+        configure(a, p);
+        configure(b, p);
+        auto la = sine(220, 0.4f, n / 2), lb = la;
+        double diff = 0, peak = 0;
+        for (size_t i = 0; i + 128 <= la.size(); i += 128) {
+            a.process(&la[i], nullptr, &la[i], nullptr, 128);
+            b.process(&lb[i], nullptr, &lb[i], nullptr, 128);
+        }
+        for (size_t i = 0; i < la.size(); ++i) {
+            diff = std::max(diff, double(std::fabs(la[i] - lb[i])));
+            peak = std::max(peak, double(std::fabs(lb[i])));
+        }
+        check(sk::neonAvailable() && db(diff / peak) < -90, "NEON and plain paths agree (dB below peak)", db(diff / peak));
+    }
+#endif
     {   // Mono host buffers (inR/outR null) work.
         double g = db(rms(render(clean(), sine(1000, 0.05f, n / 4), true), skip / 4) / rms(sine(1000, 0.05f, n / 4), skip / 4));
         check(std::fabs(g) < 0.5, "Mono in/out passes 1kHz |dB| < 0.5", g);

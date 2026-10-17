@@ -32,7 +32,7 @@ TEXTS = [
     (1, "DUAL MULTIMODE", 1113, 520, 30, INK, "SemiBold"),
     (1, "FILTER BANK", 1113, 556, 30, INK, "SemiBold"),
     (1, "model of the Sherman Filterbank 2", 1113, 612, 19, INK_DIM, "Regular"),
-    (1, "v0.2.0", 1113, 646, 19, INK_DIM, "Regular"),
+    (1, "v0.3.0", 1113, 646, 19, INK_DIM, "Regular"),
     (2, "Arrows or Q-Link 1 pick a preset; LOAD recalls it (so does MPC's PRESET menu).", 640, 590, 22, INK_DIM, "Regular"),
     (2, "SAVE stores the current sound in the selected User slot.", 640, 626, 22, INK_DIM, "Regular"),
     (2, "Every setting is also saved with the project.", 640, 662, 22, INK_DIM, "Regular"),
