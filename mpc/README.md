@@ -23,13 +23,13 @@ its own font, using the plugin's parameter names, for example "LFO Speed".*
 
 ## Install
 
-1. Download `dist/SK-Filterbank-0.3.0-mpc-armv7.zip` from this repo.
+1. Download `dist/SK-Filterbank-0.3.1-mpc-armv7.zip` from this repo.
 2. **Save your project.** The installer stops MPC and starts it again.
 3. Copy the zip to the Force and run the installer:
    ```sh
-   scp SK-Filterbank-0.3.0-mpc-armv7.zip root@<force-ip>:/tmp/
+   scp SK-Filterbank-0.3.1-mpc-armv7.zip root@<force-ip>:/tmp/
    ssh root@<force-ip>
-   cd /tmp && unzip -o SK-Filterbank-0.3.0-mpc-armv7.zip && sh SK-Filterbank-0.3.0/install.sh
+   cd /tmp && unzip -o SK-Filterbank-0.3.1-mpc-armv7.zip && sh SK-Filterbank-0.3.1/install.sh
    ```
    The installer is the toolkit's tested one:
    - It checks the device and stops MPC (the `acvs` or `inmusic-mpc` service).
@@ -42,7 +42,7 @@ its own font, using the plugin's parameter names, for example "LFO Speed".*
 4. On the Force, add **SK Filterbank** (manufacturer *Sher Khan*) to a track's insert effects from the plugin effects.
    The FILTERS / MODULATION / PRESETS tabs at the bottom switch pages, and the Q-Links follow the page.
 
-Upgrading from 0.2.0: projects and User presets carry over unchanged (same controls, same saved state). Upgrading
+Upgrading from 0.2.0 or 0.3.0: projects and User presets carry over unchanged (same controls, same saved state). Upgrading
 from 0.1.0: the controls changed completely, so a project saved with 0.1.0 opens with this plugin at its Init sound.
 
 Install on the internal drive (the default). A Force SSD is usually mounted `noexec`. MPC then lists the plugin but can
@@ -54,7 +54,7 @@ If you use MockbaMod's VST scanner (`vstscanner.sh`), it rebuilds the plugin lis
 ### Uninstall
 
 ```sh
-ssh root@<force-ip> sh /tmp/SK-Filterbank-0.3.0/uninstall.sh
+ssh root@<force-ip> sh /tmp/SK-Filterbank-0.3.1/uninstall.sh
 ```
 (If `/tmp` was cleared by a reboot, copy and unzip the package again first.) This stops MPC, removes the plugin and its
 plugin-list entry (after a backup), and starts MPC. Your `presets/` folder is kept. Projects that used the plugin open
@@ -81,6 +81,39 @@ without it.
 
 Factory presets: Init, Acid Squelch, Funk Follower, Twin Notch Sweep, Stereo Wobble, Vowel Bank, Drum Crusher,
 Screaming Ring, Audio FM Growl, Sub Rumble, Harmonic Pluck, Slow Motion.
+
+## What's new in 0.3.1
+
+Less CPU again. Controls and saved state are unchanged.
+
+- **Silence costs almost nothing.** MPC keeps calling insert effects on silent tracks and with the transport
+  stopped. 0.3.0 ran the full DSP on that silence; 0.3.1 sleeps.
+  - It sleeps after 256 samples (6 ms) of input under -140 dBFS, once its output has died away under -90 dBFS and
+    nothing in it can sound by itself: no self-oscillation, envelope at rest, no knob gliding.
+  - Asleep, it outputs exact silence and skips the DSP: 5,400 instructions per 128-frame block instead of 212,000.
+  - Any input, knob change or TRIG wakes it at once, with the filters at rest, as if freshly loaded.
+- **Faster while playing.** The NEON path now processes 32 samples at a time instead of one. Instructions per
+  128-frame block, counted on the ARM build under emulation:
+
+  | Sound | 0.2.0 | 0.3.0 | 0.3.1 |
+  |---|---|---|---|
+  | Init | 513k | 221k | 170k |
+  | Acid Squelch-like (envelope sweep, grit) | | 269k | 210k |
+  | Audio FM Growl-like | | 264k | 225k |
+  | Screaming Ring-like (self-oscillation, AM) | | 233k | 180k |
+  | Drum Crusher-like (+28 dB, grit, Limit) | | 292k | 217k |
+
+  - Heavy drive no longer drops into slow plain code: every case of the overdrive's anti-aliasing now runs in NEON,
+    including steps that cross the clipper's knee, with no division.
+  - Without NEON (not the Force) the plain path is about 5% slower than 0.3.0 while playing, and sleeps in silence.
+- **One sound change: grit's clock bleed is now heard only while the clock itself is audible.**
+  - That means cutoffs under about 200-400 Hz, where the clock (50 times the cutoff) is under 10-20 kHz. Above
+    that the real chip's clock is ultrasonic.
+  - The plugin's square wave up there only aliased down into an input-independent whine. With the default
+    settings it was about -72 dBFS on silent input; with Grit at 100% and a cutoff around 600 Hz, up to about
+    -55 dBFS.
+  - That whine is gone, which is also what lets the default sound sleep. Grit's sampling, the folding of high
+    content at low cutoffs, is unchanged.
 
 ## What's new in 0.3.0
 
@@ -149,7 +182,7 @@ them.
 | FM | The input audio sweeps both cutoffs |
 | AM | The output is amplitude-modulated by filter 2's output (try it with Reso 2 self-oscillating) |
 | Byp/Eff | Dry/wet. The dry signal is delay-compensated, so there's no comb filtering |
-| Output, Grit | Plugin additions: output level, and how much of the switched-capacitor sampling and clock bleed you hear (only below ~1.7 kHz cutoff) |
+| Output, Grit | Plugin additions: output level, and how much of the switched-capacitor sampling (below ~1.7 kHz cutoff) and clock bleed (below ~400 Hz, where the clock is audible) you hear |
 
 The plugin reports 36 samples (0.8 ms) of latency. That is the 4x oversampling filters.
 
@@ -157,11 +190,11 @@ The plugin reports 36 samples (0.8 ms) of latency. That is the 4x oversampling f
 
 | Check | Result |
 |---|---|
-| DSP tests (`make test`, and on the ARM build under qemu-arm) | 44/44: unity at noon, filter slopes, notch from the Correction knob, resonance, filter 2 self-oscillation, harmonic lock, Par/Ser, Hi Cut/Boost, ADSR/AR/follower, SensiTrig, TRIG, LFO rate, AM and FM sidebands, grit, aliasing, no clicks from switches and knobs, NaN safety, stress. On ARM, NEON and the plain path agree to -116 dB |
+| DSP tests (`make test`, and on the ARM build under qemu-arm) | 49/49: unity at noon, filter slopes, notch from the Correction knob, resonance, filter 2 self-oscillation, harmonic lock, Par/Ser, Hi Cut/Boost, ADSR/AR/follower, SensiTrig, TRIG, LFO rate, AM and FM sidebands, grit, aliasing, no clicks from switches and knobs, sleep in silence and waking on input, knob change and TRIG (never while self-oscillating or with an audible clock bleed), NaN safety, stress. On ARM, NEON and the plain path agree to -113 dB |
 | VST2 host test, x86 and the **real ARM binary under qemu-arm** (with and without NEON) | 51/51: parameters and value texts, Q-Link nudges on switches, the PRESET menu, user preset save/load, buttons springing back, the project chunk with the preset, chunk-load jumps, a mid-note preset crossfade without a click, host updates spread over blocks, in-place buffers, presets folder found next to the `.so` |
 | Binary | armv7 hard-float, exports only `VSTPluginMain`, needs only libc/libm, highest glibc symbol 2.29 (the Force has 2.39) |
 | Installer | install, upgrade and uninstall under BusyBox 1.36.1 (the Force's version) against a mock `MPC.settings`: one entry, other plugins untouched, User presets kept on upgrade and uninstall |
-| CPU | ARM instructions per 128-frame block (counted under qemu): 220k with NEON, 310k without, against 513k for 0.2.0. On an x86 VM the toolkit's bench idles at 2.5% of a block (0.2.0: 3.3%). **Not timed on a Force** |
+| CPU | ARM instructions per 128-frame block (counted under qemu), Init: 170k with NEON (0.3.0: 221k, 0.2.0: 513k), 326k without; 5.4k when asleep in silence. On an x86 VM the toolkit's bench idles at 2.0% of a block (0.3.0: 2.5%, 0.2.0: 3.3%). **Not timed on a Force** |
 
 **Not verified:**
 - Loading on a real Force.
@@ -176,7 +209,8 @@ Please run the device CPU check before relying on several instances:
 MPC_VST=../mpc-vst-plugins mpc/bench.sh <force-ip>       # PASS / WARN / FAIL, nothing is installed
 ```
 
-Read its "idle" and "audio in" rows for the plugin's own cost. Its sweep rows set random parameters every block,
+Read its "idle" and "audio in" rows for the plugin's own cost (the bench feeds noise even in "idle", so it never
+shows the sleep in silence). Its sweep rows set random parameters every block,
 including LOAD and SAVE. So they also time preset files being written and read, and preset crossfades, where two
 sounds run side by side. On MPC those buttons are pressed from the screen, not on the audio thread, and only now and
 then.
@@ -198,7 +232,7 @@ then.
 sudo apt install g++-arm-linux-gnueabihf qemu-user python3-pil   # Debian/Ubuntu
 git clone https://github.com/sd88me/mpc-vst-plugins ../mpc-vst-plugins
 git -C ../mpc-vst-plugins checkout 3a54b72cd172c840881b0be4f887653cc0829bf0
-mpc/build.sh 0.3.0          # tests (x86 and ARM), Force build, binary checks, skin, dist/SK-Filterbank-0.3.0-mpc-armv7.zip
+mpc/build.sh 0.3.1          # tests (x86 and ARM), Force build, binary checks, skin, dist/SK-Filterbank-0.3.1-mpc-armv7.zip
 ```
 
 Files:

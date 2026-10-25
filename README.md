@@ -7,9 +7,22 @@ saved with the project, it has factory and user presets, and it installs with ro
 **[mpc/README.md](mpc/README.md)** to install it. The same DSP core also builds as an LV2 plugin for desktop
 listening tests.
 
-**Download for the Force:** [`dist/SK-Filterbank-0.3.0-mpc-armv7.zip`](dist/SK-Filterbank-0.3.0-mpc-armv7.zip)
+**Download for the Force:** [`dist/SK-Filterbank-0.3.1-mpc-armv7.zip`](dist/SK-Filterbank-0.3.1-mpc-armv7.zip)
 
-**New in 0.3.0:** less CPU and smoother operation, with the same controls. The sound changes in three details:
+**New in 0.3.1:** less CPU again. Controls and saved state are unchanged.
+- **Silence costs almost nothing.** After a few ms of silent input, the plugin stops processing and outputs exact
+  silence, provided nothing in it can sound by itself: no self-oscillation, envelope at rest, no knob gliding. MPC
+  keeps feeding silent tracks and a stopped transport, so in a real project this is most of the saving. Any input,
+  knob change or TRIG wakes it at once.
+- **Faster with sound too.** With NEON the oversampled path now runs 32 samples at a time instead of one. Per block
+  that is 170k instructions instead of 221k for the Init sound (23% fewer, 67% fewer than 0.2.0). Heavily driven
+  sounds gain the most (Crusher: 292k to 217k).
+- **One sound change: grit's clock bleed is now heard only while the clock itself is audible** (cutoffs under about
+  200-400 Hz). Above that the real chip's clock is ultrasonic. The plugin's square wave up there only aliased down
+  into a faint whine, about -72 dBFS on silent input with the default settings. That whine is gone, which also lets
+  the plugin sleep. The grit sampling effect is unchanged.
+
+**0.3.0:** less CPU and smoother operation, with the same controls. The sound changed in three details:
 - The output safety limiter is now exactly linear up to 0 dBFS (0.2.0's took 0.16 dB off a full-scale signal).
 - With LIMIT on, AM and the clock bleed sound the same as with it off.
 - The cutoff knobs glide over 30 ms instead of 15.
@@ -21,7 +34,7 @@ The other changes:
 - **Switches.** LIMIT, HARMONICS, LFO F2 and the LFO shape no longer click when you switch them during playback.
 - **Presets.** Picking a preset during playback crossfades from the old sound to the new one in 30 ms.
 
-Projects and User presets from 0.2.0 load unchanged. See [mpc/README.md](mpc/README.md#whats-new-in-030).
+Projects and User presets from 0.2.0 and 0.3.0 load unchanged. See [mpc/README.md](mpc/README.md#whats-new-in-031).
 
 ## Read this first
 
@@ -52,7 +65,7 @@ Everything between the overdrive and the limiter runs **4x oversampled** through
 
 | Hardware trait | How it is modelled |
 |---|---|
-| LTC1060 switched-capacitor filters | 12 dB/oct TPT state-variable filters. The input is sample-and-held at the filter clock (50 x cutoff), so low cutoffs fold high content down. Clock bleed is scaled by **Grit**, which only acts below ~1.7 kHz, where the clock enters the audio-rate model |
+| LTC1060 switched-capacitor filters | 12 dB/oct TPT state-variable filters. The input is sample-and-held at the filter clock (50 x cutoff), so low cutoffs fold high content down. Both that and the clock bleed are scaled by **Grit**. The sampling acts below ~1.7 kHz, where the clock enters the audio-rate model; the bleed acts only while the clock is audible (fading out from 10 to 20 kHz, cutoffs ~200-400 Hz) |
 | Screaming resonance, self-oscillation | Amplitude-dependent damping (Van der Pol style). Resonance compresses on loud input, and full resonance starts oscillating from the -110 dBFS noise floor and settles at a stable, loud level. Filter 1 only just gets there; filter 2 screams. Small signals see an exactly linear filter |
 | Input overdrive | Asymmetric Pade-tanh clipper (even harmonics), unity small-signal gain, first-order antiderivative anti-aliasing |
 | Correction knob | Adds band-pass (left) or LP + HP - BP (right), so band-pass mode becomes a notch |
@@ -70,13 +83,15 @@ Measured (see `tests/test_core.cpp`): the passband is flat to within 0.1 dB, and
 
 | CPU | How |
 |---|---|
-| No divisions, (almost) no libm on the audio path | The cutoff comes from a compile-time table. The divisions that remain share one reciprocal (Montgomery's trick), and the output limiter needs none below 0 dBFS. Glides are linear ramps per 32 samples that cost nothing once settled. |
-| NEON, picked at load time | The FIRs run four taps at a time, the overdrive four oversampled steps at a time, and the two filters both channels at a time. Without NEON (or with `SK_NO_NEON=1`) the plain path runs; the two agree to -116 dB. |
+| No divisions, (almost) no libm on the audio path | The cutoff comes from a compile-time table. The divisions that remain share one reciprocal (Montgomery's trick), and the output limiter needs none below 0 dBFS. |
+| Segments | Each block runs in segments of up to 32 samples: control per sample, then the oversampled path, then the output. Glides are linear ramps per segment that cost nothing once settled, and steady cutoffs are worked out once per segment. |
+| NEON, picked at load time | The oversampled path runs a whole segment at a time: the FIRs four outputs at a time, the overdrive four steps at a time (every ADAA case, knee crossings included, with no division), the two filters both channels at a time with their states in registers. Without NEON (or with `SK_NO_NEON=1`) the plain path runs; the two agree to -113 dB. |
+| Sleep | After 256 samples of input under -140 dBFS, with the output under -90 dBFS and nothing able to sound by itself, the DSP stops and the output is exact silence. Input, a parameter change or TRIG wakes it. |
 
 ## Build and test
 
 ```sh
-make && make test        # LV2 bundle, x86 VST2 build; DSP tests (44) + VST2 host test (51)
+make && make test        # LV2 bundle, x86 VST2 build; DSP tests (49) + VST2 host test (51)
 make force test-force    # the Force binary (arm-linux-gnueabihf-g++); under qemu-arm the DSP tests on the NEON path
                          # (including NEON vs plain) and the host test with and without NEON
 mpc/build.sh             # everything above + skin + installer zip (needs the mpc-vst-plugins checkout, see mpc/README.md)

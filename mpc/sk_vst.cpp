@@ -65,7 +65,7 @@ constexpr int32_t kPlugCategEffect = 1;
 
 // ---- Identity (keep uid and the parameter order fixed across releases: projects store both) --------------
 constexpr int32_t kUniqueId = 0x53684b66;  // 'ShKf'
-constexpr int32_t kVersion = 3000;         // 0.3.0
+constexpr int32_t kVersion = 3001;         // 0.3.1
 constexpr const char* kName = "SK Filterbank";
 constexpr const char* kVendor = "Sher Khan";
 constexpr const char* kChunkMagic = "SKFB2";  // 0.1.0 wrote SKFB1 with a different parameter set: not read

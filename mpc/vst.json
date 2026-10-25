@@ -2,7 +2,7 @@
   "name": "SK Filterbank",
   "vendor": "Sher Khan",
   "uid": "ShKf",
-  "version": 3000,
+  "version": 3001,
   "so": "sk_filterbank.so",
   "params": "params.json",
   "layout": "layout.conf",

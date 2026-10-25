@@ -10,7 +10,7 @@
 //     just reaches self-oscillation, filter 2 screams), ADSR depth (filter 1 positive, filter 2 bipolar), L-B-H
 //     morph and the CORRECTION knob (+BP / 0 / -BP+LH = notch). A -110 dBFS noise floor lets full resonance start
 //     on its own. The input of each filter is sampled at its switched-capacitor clock (50 x cutoff), so low
-//     cutoffs fold high content down ("grit"), plus a little clock bleed.
+//     cutoffs fold high content down ("grit"), plus a little clock bleed while the clock is audible.
 //   * PAR/SER: a continuous blend from parallel (filter 1 + filter 2) to serial (filter 1 into filter 2).
 //   * HARMONICS: filter 2 free, or locked to filter 1 at one of 11 ratios (unison down to 4 octaves below).
 //   * ENVELOPE: ADSR (bipolar sustain), AR one-shot, or envelope follower (sustain knob = sensitivity), gated by
@@ -29,9 +29,12 @@
 // CPU (the Force's Cortex-A17 has a slow, unpipelined divider and no fast libm): the audio path makes no libm
 // calls, the cutoff comes from a table, each oversampled step needs one division for both filters (Montgomery's
 // trick), the overdrive one per four steps, the output limit none below 0 dBFS; both channels share each FIR
-// coefficient load; parameter glides are linear ramps per 32-sample segment and cost nothing once settled, and
-// static cutoffs are worked out once per segment. With NEON (picked at load time) the FIRs run four taps at a
-// time, the overdrive four steps at a time and the filters both channels at a time, with no division at all.
+// coefficient load. Processing runs in segments of up to 32 samples: control per sample, then the oversampled
+// path, then the output. Glides are linear ramps per segment that cost nothing once settled, and static cutoffs
+// are worked out once per segment. With NEON (picked at load time) the oversampled path runs a whole segment at a
+// time: the FIRs four outputs at a time, the overdrive four steps at a time (every ADAA case, including the knee
+// crossings, without a division), the filters both channels at a time with their states in registers. After a
+// few ms of silence with nothing sounding it sleeps (see asleep()).
 //
 // Parameters are normalized 0..1. ParamId order is the plugin's parameter index: never reorder it (projects
 // store values by index), only append.
@@ -331,37 +334,6 @@ SK_INLINE void dot2(const float* c, const float* a, const float* b, float& ya, f
     yb = (b0 + b1) + (b2 + b3);
 }
 
-#if SK_NEON
-template <int N>
-SK_NEON_FN void dot2Neon(const float* c, const float* a, const float* b, float& ya, float& yb) {
-    static_assert(N % 4 == 0 || N % 4 == 2, "dot2Neon handles N = 4k or 4k + 2");
-    float32x4_t a0 = vdupq_n_f32(0.f), a1 = a0, b0 = a0, b1 = a0;
-    int j = 0;
-#pragma GCC unroll 8
-    for (; j + 7 < N; j += 8) {
-        const float32x4_t c0 = vld1q_f32(c + j), c1 = vld1q_f32(c + j + 4);
-        a0 = vmlaq_f32(a0, c0, vld1q_f32(a + j));
-        b0 = vmlaq_f32(b0, c0, vld1q_f32(b + j));
-        a1 = vmlaq_f32(a1, c1, vld1q_f32(a + j + 4));
-        b1 = vmlaq_f32(b1, c1, vld1q_f32(b + j + 4));
-    }
-    if (j + 3 < N) {
-        const float32x4_t c0 = vld1q_f32(c + j);
-        a0 = vmlaq_f32(a0, c0, vld1q_f32(a + j));
-        b0 = vmlaq_f32(b0, c0, vld1q_f32(b + j));
-        j += 4;
-    }
-    const float32x4_t sa = vaddq_f32(a0, a1), sb = vaddq_f32(b0, b1);
-    float32x2_t r = vpadd_f32(vadd_f32(vget_low_f32(sa), vget_high_f32(sa)), vadd_f32(vget_low_f32(sb), vget_high_f32(sb)));
-    if (N - j == 2) {
-        const float32x2_t cc = vld1_f32(c + j);
-        r = vadd_f32(r, vpadd_f32(vmul_f32(cc, vld1_f32(a + j)), vmul_f32(cc, vld1_f32(b + j))));
-    }
-    ya = vget_lane_f32(r, 0);
-    yb = vget_lane_f32(r, 1);
-}
-#endif
-
 // Kaiser-windowed halfband FIR with 2L+1 taps, for a 2x interpolator/decimator pair. Every other tap of a
 // halfband is zero except the centre one (0.5), so each direction costs about L multiplies per input sample.
 // The nonzero side taps sit at even k when L is odd and at odd k when L is even.
@@ -416,23 +388,6 @@ struct Upsampler2x {
             yb[0] = hb[pos + kD]; yb[1] = 2.f * accB;
         }
     }
-#if SK_NEON
-    SK_NEON_FN void processNeon(const HB& h, float xa, float xb, float* ya, float* yb) {
-        pos = (pos == 0 ? HB::kSide : pos) - 1;
-        ha[pos] = ha[pos + HB::kSide] = xa;
-        hb[pos] = hb[pos + HB::kSide] = xb;
-        float accA, accB;
-        dot2Neon<HB::kSide>(h.c, ha + pos, hb + pos, accA, accB);
-        constexpr int kD = HB::kOdd ? (L - 1) / 2 : L / 2;
-        if (HB::kOdd) {
-            ya[0] = 2.f * accA; ya[1] = ha[pos + kD];
-            yb[0] = 2.f * accB; yb[1] = hb[pos + kD];
-        } else {
-            ya[0] = ha[pos + kD]; ya[1] = 2.f * accA;
-            yb[0] = hb[pos + kD]; yb[1] = 2.f * accB;
-        }
-    }
-#endif
 };
 
 // Stereo v[2n], v[2n+1] -> z[n]. Group delay: L input samples.
@@ -462,26 +417,6 @@ struct Downsampler2x {
             zb = sb + 0.5f * evb[pe + L / 2];
         }
     }
-#if SK_NEON
-    SK_NEON_FN void processNeon(const HB& h, float a0, float a1, float b0, float b1, float& za, float& zb) {
-        pe = (pe == 0 ? kE : pe) - 1;
-        eva[pe] = eva[pe + kE] = a0;
-        evb[pe] = evb[pe + kE] = b0;
-        po = (po == 0 ? kO : po) - 1;
-        oda[po] = oda[po + kO] = a1;
-        odb[po] = odb[po + kO] = b1;
-        float sa, sb;
-        if (HB::kOdd) {
-            dot2Neon<HB::kSide>(h.c, eva + pe, evb + pe, sa, sb);
-            za = sa + 0.5f * oda[po + kO - 1];
-            zb = sb + 0.5f * odb[po + kO - 1];
-        } else {
-            dot2Neon<HB::kSide>(h.c, oda + po + 1, odb + po + 1, sa, sb);
-            za = sa + 0.5f * eva[pe + L / 2];
-            zb = sb + 0.5f * evb[pe + L / 2];
-        }
-    }
-#endif
 };
 
 // Topology-preserving state-variable filter (Zavalishin) with amplitude-dependent damping: the damping grows
@@ -558,9 +493,12 @@ public:
         eqA_ = 1.f - std::exp(-2.f * kPi * 2500.f / fs_);
         detAtk_ = timeCoef(0.0005f);
         detRel_ = timeCoef(0.040f);
+        detFallLog_ = std::log(1.f - detRel_);
         uOff_ = std::log2(20.f / fsOs_);
         uLo_ = std::log2(10.f / fsOs_);
         if (uLo_ < CutoffTable::kU0) uLo_ = CutoffTable::kU0;
+        bleedTop_ = 20000.f / fsOs_;
+        bleedSlope_ = fsOs_ / 10000.f;
         glideRestart_ = std::exp(-1.f / (0.002f * fs_));
         glideShape_ = std::exp(-1.f / (0.030f * fs_));
         lfoGlide_ = glideRestart_;
@@ -587,6 +525,11 @@ public:
         lfoJump_ = false;
         lfoShape_ = map::option(norm_[kLfoShape], 3);
         limit_ = map::option(norm_[kTrigMode], 3) == kLimit ? 0.5f : 1.f;
+        asleep_ = false;
+        quietRun_ = 0;
+#if SK_NEON
+        for (NeonFir& f : nf_) f = NeonFir{};
+#endif
         computeTargets();
         settle();  // no glide from stale values after a reset
     }
@@ -613,10 +556,16 @@ public:
     float envelope() const { return env_; }
     float lfo() const { return lfo_; }  // the LFO's last value, -1..1
 
+    // Sleep: once the input has been silent for a while (kQuietRun samples under -140 dBFS), the output has died
+    // away (under -90 dBFS) and nothing can make a sound by itself (no self-oscillation, envelope and glides at
+    // rest), process() outputs silence without running the DSP. Input, any parameter change or TRIG wakes it, with
+    // the filters where they were (at rest). Hosts keep feeding silent tracks and stopped transports, so this is
+    // where most of the saving in a real project is.
+    bool asleep() const { return asleep_; }
+
     // In-place safe. inR/outR may be null (mono).
     void process(const float* inL, const float* inR, float* outL, float* outR, uint32_t n) {
         ScopedFlushDenormals ftz;
-        computeTargets();
         const int envMode = map::option(norm_[kEnvMode], 3);
         const int trigMode = map::option(norm_[kTrigMode], 3);
         const int lfoShape = map::option(norm_[kLfoShape], 3);
@@ -635,6 +584,19 @@ public:
             limit_ = limitIn;
         }
         const float invLimit = 1.f / limitIn;
+        const float lfoInc = std::fmin(map::lfoHz(norm_[kLfoSpeed]) / fs_, 0.49f);
+        if (asleep_) {
+            if (manualHold_ == 0 && unchangedSinceSleep() && quiet(inL, n) && (!inR || quiet(inR, n))) {
+                doze(n, lfoInc);
+                for (uint32_t i = 0; i < n; ++i) {
+                    outL[i] = 0.f;
+                    if (outR) outR[i] = 0.f;
+                }
+                return;
+            }
+            asleep_ = false;
+        }
+        computeTargets();
         const float threshold = trigMode == kSensiTrig ? 0.5f * kTrigThreshold : kTrigThreshold;
         // Envelope coefficients. The attack aims past 1 (an RC charging towards a higher rail) so it lands on the
         // peak in the knob's time; decay and release reach ~98% of the way in the knob's time.
@@ -644,27 +606,41 @@ public:
         const float sus = map::sustain(norm_[kSustain]);
         const float sens = std::pow(8.f, sus);  // follower: the sustain knob is the sensitivity, -18 .. +18 dB
         const float fAtk = timeCoef(map::attackMs(norm_[kAttack]) * 0.001f);
-        const float lfoInc = std::fmin(map::lfoHz(norm_[kLfoSpeed]) / fs_, 0.49f);
+        float inPeak = 0.f, outPeak = 0.f;
         bool bad = false;
+        Segment seg;
 
         for (uint32_t i0 = 0; i0 < n; i0 += kSegment) {
-            const uint32_t end = n - i0 < kSegment ? n : i0 + kSegment;
-            beginRamps(end - i0);
+            const uint32_t m = n - i0 < kSegment ? n - i0 : kSegment;
+            beginRamps(m);
             // The filter coefficients only change per sample while something sweeps the cutoffs: a glide in
             // progress, the envelope or LFO with some depth, or FM. Otherwise they are worked out once here.
             const bool sweeping = (movingMask_ & kCutoffGroup) != 0 || cur_[sFm] > 1e-4f || cur_[sLfoOct] != 0.f ||
                                   cur_[sAdsr1] != 0.f || cur_[sAdsr2] != 0.f;
-            Stage fa[2], fb[2];
-            if (!sweeping) stages(0.f, 0.f, fa, fb);
-            for (uint32_t i = i0; i < end; ++i) {
-                const float in[2] = {sanitize(inL[i]), inR ? sanitize(inR[i]) : sanitize(inL[i])};
-                for (int k = 0; k < numMoving_; ++k) cur_[moving_[k]] += inc_[moving_[k]];
+            // The output weights only change while L-B-H or Correction glide.
+            const bool weighing = (movingMask_ & kWeightGroup) != 0;  // implies sweeping (a subset of its group)
+            float wa[3] = {}, wb[3] = {};
+            if (!weighing) {
+                outputWeights(cur_[sLbh1], cur_[sCorr1], wa);
+                outputWeights(cur_[sLbh2], cur_[sCorr2], wb);
+            }
+            if (!sweeping) seg.shared[0] = stages(0.f, 0.f, seg.fa[0], seg.fb[0], wa, wb);
+
+            // 1. Control, per sample: input gain, gate and envelope, LFO, cutoffs, the input shelf.
+            for (uint32_t k = 0; k < m; ++k) {
+                const float in0 = sanitize(inL[i0 + k]), in1 = inR ? sanitize(inR[i0 + k]) : in0;
+                seg.in[0][k] = in0;
+                seg.in[1][k] = in1;
+                const float l0 = std::fabs(in0), l1 = std::fabs(in1);
+                inPeak = l0 > inPeak ? l0 : inPeak;
+                inPeak = l1 > inPeak ? l1 : inPeak;
+                for (int j = 0; j < numMoving_; ++j) cur_[moving_[j]] += inc_[moving_[j]];
                 const float* s = cur_;
-                const float x[2] = {in[0] * s[sInGain], in[1] * s[sInGain]};
+                const float x[2] = {in0 * s[sInGain], in1 * s[sInGain]};
 
                 // Gate and envelope, from the level after the input gain (linked stereo).
-                const float l0 = std::fabs(x[0]), l1 = std::fabs(x[1]);
-                const float lvl = l0 > l1 ? l0 : l1;
+                const float a0 = std::fabs(x[0]), a1 = std::fabs(x[1]);
+                const float lvl = a0 > a1 ? a0 : a1;
                 det_ += (lvl > det_ ? detAtk_ : detRel_) * (lvl - det_);
                 if (!gate_ && det_ > threshold) {
                     gate_ = true;
@@ -716,44 +692,61 @@ public:
                 }
                 lfo_ = lfo;
 
-                if (sweeping) stages(x[0], x[1], fa, fb);
-                const bool fm = s[sFm] > 1e-4f;
-                const Stage& fa1 = fm ? fa[1] : fa[0];
-                const Stage& fb1 = fm ? fb[1] : fb[0];
-
-                // HI CUT / HI BOOST: a first-order shelf at 2.5 kHz, before the overdrive.
-                float xe[2];
-                for (int c = 0; c < 2; ++c) {
+                if (sweeping) {
+                    if (weighing) {
+                        outputWeights(s[sLbh1], s[sCorr1], wa);
+                        outputWeights(s[sLbh2], s[sCorr2], wb);
+                    }
+                    seg.shared[k] = stages(x[0], x[1], seg.fa[k], seg.fb[k], wa, wb);
+                }
+                for (int c = 0; c < 2; ++c) {  // HI CUT / HI BOOST: a first-order shelf at 2.5 kHz, before the drive
                     Channel& ch = ch_[c];
                     ch.eqLp += eqA_ * (x[c] - ch.eqLp);
-                    xe[c] = ch.eqLp + s[sEqGain] * (x[c] - ch.eqLp);
+                    seg.xe[c][k] = ch.eqLp + s[sEqGain] * (x[c] - ch.eqLp);
                 }
-                StepGains sg;
-                sg.scale = limitIn * (1.f / kBiasSlope);
-                sg.offset = -kClipAtBias * sg.scale;
-                sg.noise = limitIn * (kNoise / 2147483648.f);
-                sg.parSer = s[sParSer];
-                sg.mixA = 0.5f * (1.f - s[sParSer]) * invLimit;
-                sg.mixB = 0.5f * (1.f + s[sParSer]) * invLimit;
-                sg.am = s[sAm];
-                sg.amIn = 2.f * invLimit;
-                float y[2];
-#if SK_NEON
-                if (neon_) oversampleNeon(xe, fa[0], fb[0], fa1, fb1, sg, y);
-                else
-#endif
-                    oversample(xe, fa[0], fb[0], fa1, fb1, sg, y);
+                seg.outGain[k] = s[sOutGain];
+                seg.mix[k] = s[sMix];
+                seg.parSer[k] = s[sParSer];
+                seg.am[k] = s[sAm];
+            }
 
+            // 2. The oversampled audio path.
+#if SK_NEON
+            if (neon_) oversampleBlock(seg, m, sweeping, limitIn, invLimit);
+            else
+#endif
+            {
+                const bool blending = (movingMask_ & ((1u << sParSer) | (1u << sAm))) != 0;
+                StepGains sg = stepGains(seg.parSer[0], seg.am[0], limitIn, invLimit);
+                for (uint32_t k = 0; k < m; ++k) {
+                    const uint32_t at = sweeping ? k : 0;
+                    const Stage* fa = seg.fa[at];
+                    const Stage* fb = seg.fb[at];
+                    const int right = seg.shared[at] ? 0 : 1;
+                    const float xe[2] = {seg.xe[0][k], seg.xe[1][k]};
+                    float y[2];
+                    if (blending) sg = stepGains(seg.parSer[k], seg.am[k], limitIn, invLimit);
+                    oversample(xe, fa[0], fb[0], fa[right], fb[right], sg, y);
+                    seg.y[0][k] = y[0];
+                    seg.y[1][k] = y[1];
+                }
+            }
+
+            // 3. Output: DC blocker, OUTPUT gain, BYP/EFF against the latency-matched dry signal.
+            for (uint32_t k = 0; k < m; ++k) {
                 for (int c = 0; c < 2; ++c) {
                     Channel& ch = ch_[c];
-                    ch.dc = y[c] - ch.dcX + dcR_ * ch.dc;  // DC blocker (the overdrive bias leaves DC)
-                    ch.dcX = y[c];
-                    const float wet = ch.dc * s[sOutGain];
-                    const float dry = ch.delayDry(in[c]);
-                    const float o = dry + s[sMix] * (wet - dry);
-                    bad |= !(std::fabs(o) < 1e4f);
-                    if (c == 0) outL[i] = o;
-                    else if (outR) outR[i] = o;
+                    const float y = seg.y[c][k];
+                    ch.dc = y - ch.dcX + dcR_ * ch.dc;  // DC blocker (the overdrive bias leaves DC)
+                    ch.dcX = y;
+                    const float wet = ch.dc * seg.outGain[k];
+                    const float dry = ch.delayDry(seg.in[c][k]);
+                    const float o = dry + seg.mix[k] * (wet - dry);
+                    const float ao = std::fabs(o);
+                    bad |= !(ao < 1e4f);
+                    outPeak = ao > outPeak ? ao : outPeak;
+                    if (c == 0) outL[i0 + k] = o;
+                    else if (outR) outR[i0 + k] = o;
                 }
             }
             endRamps();
@@ -764,6 +757,12 @@ public:
                 outL[i] = 0;
                 if (outR) outR[i] = 0;
             }
+            return;
+        }
+        quietRun_ = inPeak < kQuietIn ? (quietRun_ < kQuietRun ? quietRun_ + n : kQuietRun) : 0;
+        if (quietRun_ >= kQuietRun && outPeak < kQuietOut && canSleep()) {
+            asleep_ = true;
+            for (int i = 0; i < kNumParams; ++i) sleepNorm_[i] = norm_[i];
         }
     }
 
@@ -771,7 +770,11 @@ private:
     static constexpr float kNoise = 3e-6f;   // ~ -110 dBFS analog noise floor
     static constexpr float kClipAtBias = softClip(kBias);
     static constexpr float kUHi = -2.0588937f;  // log2(0.24): highest cutoff 0.24 fsOs (42 kHz at 44.1 kHz)
-    static constexpr uint32_t kSegment = 32;     // parameter ramps are linear over segments of this many samples
+    static constexpr uint32_t kSegment = 32;     // processed in segments of this many samples (glides ramp per segment)
+    static constexpr float kQuietIn = 1e-7f;     // -140 dBFS: input this quiet counts as silence
+    static constexpr float kQuietOut = 3e-5f;    // -90 dBFS: output this quiet may stop
+    static constexpr uint32_t kQuietRun = 256;   // samples of silent input before sleeping (flushes the FIRs)
+    static constexpr float kNoSelfOsc = 0.05f;   // damping above this: the filters can't oscillate by themselves
     // The noise LCG (x' = 1664525 x + 1013904223) advanced 1..4 steps at once: x_k = kLcgMul[k-1] x + kLcgAdd[k-1].
     static constexpr uint32_t kLcgMul[4] = {1664525u, 1664525u * 1664525u, 1664525u * 1664525u * 1664525u,
                                             1664525u * 1664525u * 1664525u * 1664525u};
@@ -789,19 +792,42 @@ private:
                                              (1u << sLbh1) | (1u << sLbh2) | (1u << sCorr1) | (1u << sCorr2) |
                                              (1u << sAdsr1) | (1u << sAdsr2) | (1u << sLfoOct) | (1u << sFm) |
                                              (1u << sGrit) | (1u << sHarm) | (1u << sF2) | (1u << sLock);
+    static constexpr uint32_t kWeightGroup = (1u << sLbh1) | (1u << sLbh2) | (1u << sCorr1) | (1u << sCorr2);
     static constexpr bool kSlowGlide[kNumSmoothed] = {false, false, false, true, true, false, false, false,
                                                       false, false, false, false, false, false, false, false,
                                                       false, false, false, true, false, false};
 
-    struct Stage {
+    struct Stage {  // the NEON path loads these as two vectors of four (keep the order and the size)
         float g, k, wl, wb, wh, grit, leak;
         uint32_t clk;  // clock increment per oversampled step, a 32-bit fraction of a period (when grit is on)
     };
+    static_assert(sizeof(Stage) == 32, "Stage is eight 32-bit fields");
     // Per-sample gains of the oversampled steps (the LIMIT pad and make-up folded in).
     struct StepGains {
         float scale, offset, noise;  // overdrive out = ADAA * scale + offset + noise source * noise
         float parSer, mixA, mixB;    // filter 2 input = d + parSer (y1 - d); out = mixA y1 + mixB y2 (PAR/SER)
         float am, amIn;              // AM depth; modulator = softClip(amIn * y2)
+    };
+    static StepGains stepGains(float parSer, float am, float limitIn, float invLimit) {
+        StepGains sg;
+        sg.scale = limitIn * (1.f / kBiasSlope);
+        sg.offset = -kClipAtBias * sg.scale;
+        sg.noise = limitIn * (kNoise / 2147483648.f);
+        sg.parSer = parSer;
+        sg.mixA = 0.5f * (1.f - parSer) * invLimit;
+        sg.mixB = 0.5f * (1.f + parSer) * invLimit;
+        sg.am = am;
+        sg.amIn = 2.f * invLimit;
+        return sg;
+    }
+    // One segment of per-sample data, handed from one pass of process() to the next.
+    struct Segment {
+        float in[2][kSegment];  // the input, sanitized (the dry path)
+        float xe[2][kSegment];  // after the input gain and the HI CUT / HI BOOST shelf
+        float y[2][kSegment];   // the oversampled path's output
+        float outGain[kSegment], mix[kSegment], parSer[kSegment], am[kSegment];
+        Stage fa[kSegment][2], fb[kSegment][2];  // [sample][channel]; only [0] while the cutoffs hold still
+        bool shared[kSegment];                   // both channels use [0] (no FM)
     };
 
     struct Channel {
@@ -951,25 +977,28 @@ private:
         for (int k = 0; k < numMoving_; ++k) cur_[moving_[k]] = end_[moving_[k]];  // land exactly
     }
 
-    // Both filters' coefficients for this sample (x0, x1: the input level per channel, for FM). Cutoffs in
-    // octaves above 20 Hz. In HARMONICS mode filter 2 follows filter 1's whole control voltage at the chosen
-    // ratio; its own ADSR depth still adds on top. Locking and unlocking crossfade.
-    SK_INLINE void stages(float x0, float x1, Stage* fa, Stage* fb) const {
+    // Both filters' coefficients for this sample (x0, x1: the input level per channel, for FM; wa, wb: the output
+    // weights from outputWeights). Cutoffs in octaves above 20 Hz. In HARMONICS mode filter 2 follows filter 1's
+    // whole control voltage at the chosen ratio; its own ADSR depth still adds on top. Locking and unlocking
+    // crossfade. Returns whether both channels share fa[0] and fb[0] (no FM); otherwise [1] is the right channel.
+    SK_INLINE bool stages(float x0, float x1, Stage* fa, Stage* fb, const float* wa, const float* wb) const {
         const float* s = cur_;
         const float lfoOct = s[sLfoOct] * lfo_;
         const float m1 = s[sOct1] + s[sAdsr1] * env_ + lfoOct;
         const float free2 = s[sOct2] + s[sAdsr2] * env_ + lfoOct * s[sF2];
         const float m2 = free2 + s[sLock] * (m1 + s[sHarm] + s[sAdsr2] * env_ - free2);
-        float wa[3], wb[3];
-        outputWeights(s[sLbh1], s[sCorr1], wa);
-        outputWeights(s[sLbh2], s[sCorr2], wb);
-        const bool fm = s[sFm] > 1e-4f;  // FM: the input audio itself sweeps the cutoffs, per channel
-        const float x[2] = {x0, x1};
-        for (int c = 0; c < (fm ? 2 : 1); ++c) {
-            const float sweep = fm ? s[sFm] * clampf(x[c], -1.5f, 1.5f) : 0.f;
+        if (!(s[sFm] > 1e-4f)) {
+            fa[0] = stage(m1, s[sK1], s[sGrit], wa);
+            fb[0] = stage(m2, s[sK2], s[sGrit], wb);
+            return true;
+        }
+        const float x[2] = {x0, x1};  // FM: the input audio itself sweeps the cutoffs, per channel
+        for (int c = 0; c < 2; ++c) {
+            const float sweep = s[sFm] * clampf(x[c], -1.5f, 1.5f);
             fa[c] = stage(m1 + sweep, s[sK1], s[sGrit], wa);
             fb[c] = stage(m2 + sweep, s[sK2], s[sGrit], wb);
         }
+        return false;
     }
 
     // Up to 4x, the oversampled steps of both channels, back down (y: one sample per channel).
@@ -987,20 +1016,104 @@ private:
     }
 
 #if SK_NEON
-    // The NEON twin of oversample(): FIRs four taps at a time, the overdrive four steps at a time, the filters
-    // both channels at a time. The reciprocals come from NEON's estimate refined twice (about 1 ulp), and the
-    // branches of the plain path become selects, so the two paths agree to rounding.
-    __attribute__((target("fpu=neon"), noinline)) void oversampleNeon(const float* xe, const Stage& a0, const Stage& b0,
-                                                                        const Stage& a1, const Stage& b1,
-                                                                        const StepGains& sg, float* y) {
-        float x2[2][2], v[2][4], z2[2][2];  // [channel][step]
-        up1_.processNeon(hb1_, xe[0], xe[1], x2[0], x2[1]);
-        up2_.processNeon(hb2_, x2[0][0], x2[1][0], v[0], v[1]);
-        up2_.processNeon(hb2_, x2[0][1], x2[1][1], v[0] + 2, v[1] + 2);
-        stepsNeon(v, a0, b0, a1, b1, sg);
-        down2_.processNeon(hb2_, v[0][0], v[0][1], v[1][0], v[1][1], z2[0][0], z2[1][0]);
-        down2_.processNeon(hb2_, v[0][2], v[0][3], v[1][2], v[1][3], z2[0][1], z2[1][1]);
-        down1_.processNeon(hb1_, z2[0][0], z2[0][1], z2[1][0], z2[1][1], y[0], y[1]);
+    // ---- NEON: the oversampled path a whole segment at a time --------------------------------------------------
+    // Each channel's FIRs run on linear buffers (oldest first: the history the taps reach back into, then this
+    // segment) four outputs at a time, the overdrive four oversampled steps at a time, the filters both channels at
+    // a time with their states in registers for the whole segment. The reciprocals come from NEON's estimate refined
+    // twice (about 1 ulp) and the plain path's branches become selects, so the two paths agree to rounding.
+    struct NeonFir {
+        float u1[31 + kSegment + 4];     // to 2x: 31 old inputs, then this segment (+ room for the fours)
+        float u2[9 + 2 * kSegment + 8];  // to 4x: 9 old 2x samples
+        float d2e[5 + 2 * kSegment + 8];   // from 4x, even steps: 5 old
+        float d2o[10 + 2 * kSegment + 8];  // from 4x, odd steps: 10 old
+        float d1e[31 + kSegment + 4];      // from 2x, even samples: 31 old
+        float d1o[16 + kSegment + 4];      // from 2x, odd samples: 16 old
+    };
+    NeonFir nf_[2];
+
+    __attribute__((target("fpu=neon"), noinline)) void oversampleBlock(Segment& seg, uint32_t m, bool sweeping,
+                                                                         float limitIn, float invLimit) {
+        const int mi = static_cast<int>(m), m4 = (mi + 3) & ~3, n2 = 2 * mi, n28 = (n2 + 7) & ~7;
+        float os[2][4 * kSegment + 8], acc[2 * kSegment + 8], z2[2 * kSegment + 8];
+        float dd[8 * kSegment], yy[8 * kSegment + 8];
+        // The halfbands' side taps are symmetric, so their convolution in time order uses them as they are.
+        for (int c = 0; c < 2; ++c) {  // up to 2x, then to 4x
+            NeonFir& f = nf_[c];
+            std::memcpy(f.u1 + 31, seg.xe[c], m * sizeof(float));
+            firBlock<32>(hb1_.c, f.u1, acc, m4);
+            for (int k = 0; k < m4; k += 4) {  // even 2x samples: the side taps; odd: the input 15 samples back
+                const float32x4x2_t z = {{vmulq_n_f32(vld1q_f32(acc + k), 2.f), vld1q_f32(f.u1 + k + 16)}};
+                vst2q_f32(f.u2 + 9 + 2 * k, z);
+            }
+            firBlock<10>(hb2_.c, f.u2, acc, n28);
+            for (int j = 0; j < n28; j += 4) {  // even 4x steps: the 2x input 5 back; odd: the side taps
+                const float32x4x2_t z = {{vld1q_f32(f.u2 + j + 4), vmulq_n_f32(vld1q_f32(acc + j), 2.f)}};
+                vst2q_f32(os[c] + 2 * j, z);
+            }
+            std::memmove(f.u1, f.u1 + mi, 31 * sizeof(float));
+            std::memmove(f.u2, f.u2 + n2, 9 * sizeof(float));
+        }
+        const float scale = limitIn * (1.f / kBiasSlope), offset = -kClipAtBias * scale;
+        const float noise = limitIn * (kNoise / 2147483648.f);
+        for (int q = 0; q < 4 * mi; q += 4) {  // the overdrive, interleaved into (left, right) pairs per step
+            const float32x4x2_t z = {{overdrive4(ch_[0], os[0] + q, scale, offset, noise),
+                                      overdrive4(ch_[1], os[1] + q, scale, offset, noise)}};
+            vst2q_f32(dd + 2 * q, z);
+        }
+        if (sweeping) filterBlock<true>(dd, yy, seg, m, invLimit);
+        else filterBlock<false>(dd, yy, seg, m, invLimit);
+        vst1q_f32(yy + 8 * mi, vdupq_n_f32(0.f));  // the eight values past the end that the last vld4q reads
+        vst1q_f32(yy + 8 * mi + 4, vdupq_n_f32(0.f));
+        for (int st = 0; st < 4 * mi; st += 8) {  // back to one buffer per channel and phase
+            const float32x4x4_t v = vld4q_f32(yy + 2 * st);  // left even, right even, left odd, right odd
+            vst1q_f32(nf_[0].d2e + 5 + st / 2, v.val[0]);
+            vst1q_f32(nf_[1].d2e + 5 + st / 2, v.val[1]);
+            vst1q_f32(nf_[0].d2o + 10 + st / 2, v.val[2]);
+            vst1q_f32(nf_[1].d2o + 10 + st / 2, v.val[3]);
+        }
+        for (int c = 0; c < 2; ++c) {  // down to 2x, then to 1x
+            NeonFir& f = nf_[c];
+            firBlock<10>(hb2_.c, f.d2o, acc, n28);  // odd steps through the side taps, plus the even step 5 back
+            for (int j = 0; j < n28; j += 4) vst1q_f32(z2 + j, vmlaq_n_f32(vld1q_f32(acc + j), vld1q_f32(f.d2e + j), 0.5f));
+            for (int j = 0; j < n28; j += 8) {
+                const float32x4x2_t v = vld2q_f32(z2 + j);
+                vst1q_f32(f.d1e + 31 + j / 2, v.val[0]);
+                vst1q_f32(f.d1o + 16 + j / 2, v.val[1]);
+            }
+            firBlock<32>(hb1_.c, f.d1e, acc, m4);  // even 2x samples through the side taps, plus the odd one 16 back
+            for (int k = 0; k < mi; ++k) seg.y[c][k] = acc[k] + 0.5f * f.d1o[k];
+            std::memmove(f.d2e, f.d2e + n2, 5 * sizeof(float));
+            std::memmove(f.d2o, f.d2o + n2, 10 * sizeof(float));
+            std::memmove(f.d1e, f.d1e + mi, 31 * sizeof(float));
+            std::memmove(f.d1o, f.d1o + mi, 16 * sizeof(float));
+        }
+    }
+
+    // out[n] = sum_t c[t] b[n + t] for n = 0 .. m-1 (m a multiple of 4), four outputs at a time.
+    template <int kN>
+    static SK_NEON_FN void firBlock(const float* c, const float* b, float* out, int m) {
+        static_assert(kN % 4 == 0 || kN % 4 == 2, "firBlock handles kN = 4k or 4k + 2");
+        constexpr int kQ = kN / 4;
+        float32x4_t cq[kQ];
+        for (int j = 0; j < kQ; ++j) cq[j] = vld1q_f32(c + 4 * j);
+        float32x2_t ct = vdup_n_f32(0.f);
+        if constexpr (kN % 4 != 0) ct = vld1_f32(c + 4 * kQ);
+        for (int n = 0; n < m; n += 4) {
+            float32x4_t a0 = vdupq_n_f32(0.f), a1 = a0, a2 = a0, a3 = a0;
+            const float* bb = b + n;
+#pragma GCC unroll 8
+            for (int j = 0; j < kQ; ++j, bb += 4) {
+                a0 = vmlaq_lane_f32(a0, vld1q_f32(bb), vget_low_f32(cq[j]), 0);
+                a1 = vmlaq_lane_f32(a1, vld1q_f32(bb + 1), vget_low_f32(cq[j]), 1);
+                a2 = vmlaq_lane_f32(a2, vld1q_f32(bb + 2), vget_high_f32(cq[j]), 0);
+                a3 = vmlaq_lane_f32(a3, vld1q_f32(bb + 3), vget_high_f32(cq[j]), 1);
+            }
+            if constexpr (kN % 4 != 0) {
+                a0 = vmlaq_lane_f32(a0, vld1q_f32(bb), ct, 0);
+                a1 = vmlaq_lane_f32(a1, vld1q_f32(bb + 1), ct, 1);
+            }
+            vst1q_f32(out + n, vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        }
     }
 
     // |x| < c and |x| <= c for c > 0, as integer compares of the bit patterns (exact; GCC turns float vector
@@ -1016,6 +1129,11 @@ private:
     static SK_NEON_FN uint32x2_t absAtMost(float32x2_t x, float c) {
         return vcle_u32(vand_u32(vreinterpret_u32_f32(x), vdup_n_u32(0x7fffffffu)), vdup_n_u32(bitsOf(c)));
     }
+    static SK_NEON_FN bool allLanes(uint32x4_t mask) {
+        uint32x2_t m = vpmin_u32(vget_low_u32(mask), vget_high_u32(mask));
+        m = vpmin_u32(m, m);
+        return vget_lane_u32(m, 0) != 0;
+    }
     static SK_NEON_FN float32x2_t pair(float a, float b) { return vset_lane_f32(b, vdup_n_f32(a), 1); }
     static SK_NEON_FN uint32x2_t pair(uint32_t a, uint32_t b) { return vset_lane_u32(b, vdup_n_u32(a), 1); }
     static SK_NEON_FN float32x2_t reciprocal(float32x2_t x) {
@@ -1030,20 +1148,69 @@ private:
         return vmul_f32(num, reciprocal(vmla_f32(vdup_n_f32(27.f), vdup_n_f32(9.f), c2)));
     }
     static SK_NEON_FN float32x2_t safetyLimit2(float32x2_t y) {  // safetyLimit, both lanes
+        const uint32x2_t linear = absAtMost(y, 1.f);
+        if (vget_lane_u32(vpmin_u32(linear, linear), 0)) return y;  // both under 0 dBFS: the usual case
         const float32x2_t a = vabs_f32(y);
         float32x2_t e = vmin_f32(vmul_n_f32(vsub_f32(a, vdup_n_f32(1.f)), 1.f / 3.f), vdup_n_f32(1.5f));
         e = vsub_f32(e, vmul_f32(vmul_f32(vmul_n_f32(e, 4.f / 27.f), e), e));
         const float32x2_t knee = vmla_f32(vdup_n_f32(1.f), vdup_n_f32(3.f), e);
         const float32x2_t signedKnee = vbsl_f32(vdup_n_u32(0x80000000u), y, knee);  // knee with y's sign
-        return vbsl_f32(absAtMost(y, 1.f), y, signedKnee);
+        return vbsl_f32(linear, y, signedKnee);
     }
     static SK_NEON_FN float32x2_t clockSquare2(uint32x2_t phase) {
         return vbsl_f32(vclt_u32(phase, vdup_n_u32(0x80000000u)), vdup_n_f32(1.f), vdup_n_f32(-1.f));
     }
 
-    // The overdrive of one channel's four steps (Channel::steps' first half), four lanes wide; the rare lanes
-    // that need the log or the general form are redone in plain code.
-    static SK_NEON_FN float32x4_t overdriveNeon(Channel& ch, const float* v, const StepGains& sg) {
+    // log(t) for 0.25 <= t <= 4, four lanes: Cephes' logf (about 1 ulp), mantissa reduced to [sqrt(1/2), sqrt(2)).
+    static SK_NEON_FN float32x4_t log4(float32x4_t t) {
+        const int32x4_t bits = vreinterpretq_s32_f32(t);
+        int32x4_t e = vsubq_s32(vshrq_n_s32(bits, 23), vdupq_n_s32(127));  // t > 0: no sign bit
+        float32x4_t mant = vreinterpretq_f32_s32(vorrq_s32(vandq_s32(bits, vdupq_n_s32(0x007fffff)), vdupq_n_s32(0x3f800000)));
+        const uint32x4_t big = vcgtq_u32(vreinterpretq_u32_f32(mant), vdupq_n_u32(bitsOf(1.41421356f)));
+        mant = vbslq_f32(big, vmulq_n_f32(mant, 0.5f), mant);
+        e = vsubq_s32(e, vreinterpretq_s32_u32(big));  // big lanes are -1: one more in the exponent
+        const float32x4_t x = vsubq_f32(mant, vdupq_n_f32(1.f));
+        const float32x4_t xx = vmulq_f32(x, x);
+        float32x4_t y = vmlaq_f32(vdupq_n_f32(-1.1514610310e-1f), x, vdupq_n_f32(7.0376836292e-2f));
+        y = vmlaq_f32(vdupq_n_f32(1.1676998740e-1f), y, x);
+        y = vmlaq_f32(vdupq_n_f32(-1.2420140846e-1f), y, x);
+        y = vmlaq_f32(vdupq_n_f32(1.4249322787e-1f), y, x);
+        y = vmlaq_f32(vdupq_n_f32(-1.6668057665e-1f), y, x);
+        y = vmlaq_f32(vdupq_n_f32(2.0000714765e-1f), y, x);
+        y = vmlaq_f32(vdupq_n_f32(-2.4999993993e-1f), y, x);
+        y = vmlaq_f32(vdupq_n_f32(3.3333331174e-1f), y, x);
+        y = vmulq_f32(vmulq_f32(y, x), xx);
+        const float32x4_t ef = vcvtq_f32_s32(e);
+        y = vmlaq_f32(y, ef, vdupq_n_f32(-2.12194440e-4f));
+        y = vmlsq_f32(y, xx, vdupq_n_f32(0.5f));
+        return vmlaq_f32(vaddq_f32(x, y), ef, vdupq_n_f32(0.693359375f));
+    }
+
+    // F(3) - F(x) for |x| < 3 (F: softClip's antiderivative), four lanes, with no cancellation near the knee:
+    // (9 - x^2) / 18 + 4/3 log1p(w), w = (9 - x^2) / (x^2 + 3), 0 < w <= 3.
+    static SK_NEON_FN float32x4_t kneeGap(float32x4_t x) {
+        const float32x4_t a = vabsq_f32(x), three = vdupq_n_f32(3.f);
+        const float32x4_t d = vmulq_f32(vsubq_f32(three, a), vaddq_f32(three, a));
+        const float32x4_t den = vmlaq_f32(three, a, a);
+        float32x4_t r = vrecpeq_f32(den);
+        r = vmulq_f32(vrecpsq_f32(den, r), r);
+        r = vmulq_f32(vrecpsq_f32(den, r), r);
+        const float32x4_t w = vmulq_f32(d, r);
+        float32x4_t p = vmlsq_f32(vdupq_n_f32(1.f / 7.f), w, vdupq_n_f32(0.125f));  // log1p(w) / w, small w
+        p = vmlaq_f32(vdupq_n_f32(-1.f / 6.f), w, p);
+        p = vmlaq_f32(vdupq_n_f32(0.2f), w, p);
+        p = vmlaq_f32(vdupq_n_f32(-0.25f), w, p);
+        p = vmlaq_f32(vdupq_n_f32(1.f / 3.f), w, p);
+        p = vmlaq_f32(vdupq_n_f32(-0.5f), w, p);
+        p = vmlaq_f32(vdupq_n_f32(1.f), w, p);
+        const float32x4_t l1p = vbslq_f32(absBelow(w, 0.15f), vmulq_f32(w, p), log4(vaddq_f32(vdupq_n_f32(1.f), w)));
+        return vmlaq_n_f32(vmulq_n_f32(d, 1.f / 18.f), l1p, 4.f / 3.f);
+    }
+
+    // The overdrive of one channel's four oversampled steps (Channel::steps' first half), four lanes wide, with all
+    // of the plain path's ADAA cases: inside the knee the series, or for big steps log1p(z) / z from log4; past it
+    // on one side +-1; crossing it within the step, the integral split at the knee (kneeGap).
+    static SK_NEON_FN float32x4_t overdrive4(Channel& ch, const float* v, float scale, float offset, float noise) {
         const float32x4_t x1 = vaddq_f32(vld1q_f32(v), vdupq_n_f32(kBias));  // x[q + 1]
         const float32x4_t x0 = vextq_f32(vdupq_n_f32(ch.odX), x1, 3);        // x[q]
         ch.odX = vgetq_lane_f32(x1, 3);
@@ -1062,99 +1229,139 @@ private:
         p = vmlaq_f32(vdupq_n_f32(1.f / 3.f), z, p);
         p = vmlaq_f32(vdupq_n_f32(-0.5f), z, p);
         p = vmlaq_f32(vdupq_n_f32(1.f), z, p);
+        const uint32x4_t series = absBelow(z, 0.15f);
+        if (!allLanes(vorrq_u32(series, vmvnq_u32(knee)))) {  // a big step inside the knee: log1p(z) / z
+            float32x4_t rz = vrecpeq_f32(z);
+            rz = vmulq_f32(vrecpsq_f32(z, rz), rz);
+            rz = vmulq_f32(vrecpsq_f32(z, rz), rz);
+            p = vbslq_f32(series, p, vmulq_f32(log4(vaddq_f32(vdupq_n_f32(1.f), z)), rz));
+        }
         float32x4_t y = vmlaq_n_f32(vmulq_n_f32(sum, 1.f / 18.f), vmulq_f32(q, p), 4.f / 3.f);
-        const uint32x4_t easy = vandq_u32(knee, absBelow(z, 0.15f));
-        uint32x2_t all = vpmin_u32(vget_low_u32(easy), vget_high_u32(easy));
-        all = vpmin_u32(all, all);
-        if (vget_lane_u32(all, 0) == 0) {
-            float a[4], b[4], rr[4], out[4];
-            uint32_t e[4], k[4];
-            vst1q_f32(a, x0);
-            vst1q_f32(b, x1);
-            vst1q_f32(rr, r);
-            vst1q_f32(out, y);
-            vst1q_u32(e, easy);
-            vst1q_u32(k, knee);
-            for (int l = 0; l < 4; ++l)
-                if (!e[l]) out[l] = k[l] ? softClipADAAInside(a[l], b[l], rr[l]) : softClipADAAOutside(a[l], b[l]);
-            y = vld1q_f32(out);
+        if (!allLanes(knee)) {  // past the knee: +-1 where both ends are on one side
+            const int32x4_t three = vdupq_n_s32(static_cast<int32_t>(bitsOf(3.f)));
+            const int32x4_t b0 = vreinterpretq_s32_f32(x0), b1 = vreinterpretq_s32_f32(x1);
+            const int32x4_t sign = vdupq_n_s32(static_cast<int32_t>(0x80000000u));
+            const uint32x4_t hi = vandq_u32(vcgeq_s32(b0, three), vcgeq_s32(b1, three));
+            const uint32x4_t lo = vandq_u32(vcgeq_s32(veorq_s32(b0, sign), three), vcgeq_s32(veorq_s32(b1, sign), three));
+            y = vbslq_f32(knee, y, vbslq_f32(hi, vdupq_n_f32(1.f), vbslq_f32(lo, vdupq_n_f32(-1.f), y)));
+            const uint32x4_t done = vorrq_u32(knee, vorrq_u32(hi, lo));
+            if (!allLanes(done)) {  // crossing the knee within the step: (F(x1) - F(x0)) / dx, split at the knee
+                const uint32x4_t in0 = absBelow(x0, 3.f), in1 = absBelow(x1, 3.f);
+                const float32x4_t three = vdupq_n_f32(3.f), a0 = vabsq_f32(x0), a1 = vabsq_f32(x1);
+                const float32x4_t gap = kneeGap(vbslq_f32(in0, x0, x1));  // at whichever end is inside
+                const float32x4_t up = vaddq_f32(vsubq_f32(a1, three), gap);               // x0 inside, x1 past
+                const float32x4_t down = vnegq_f32(vaddq_f32(vsubq_f32(a0, three), gap));  // x0 past, x1 inside
+                const float32x4_t df = vbslq_f32(in0, up, vbslq_f32(in1, down, vsubq_f32(a1, a0)));
+                float32x4_t rdx = vrecpeq_f32(dx);
+                rdx = vmulq_f32(vrecpsq_f32(dx, rdx), rdx);
+                rdx = vmulq_f32(vrecpsq_f32(dx, rdx), rdx);
+                y = vbslq_f32(done, y, vmulq_f32(df, rdx));
+            }
         }
         // The noise source: four LCG steps at once with jump-ahead constants, the same numbers as the plain path.
         const uint32x4_t rn = vmlaq_u32(vld1q_u32(kLcgAdd), vdupq_n_u32(ch.rng), vld1q_u32(kLcgMul));
         ch.rng = vgetq_lane_u32(rn, 3);
-        const float32x4_t noise = vcvtq_f32_s32(vreinterpretq_s32_u32(rn));
-        return vmlaq_n_f32(vmlaq_n_f32(vdupq_n_f32(sg.offset), y, sg.scale), noise, sg.noise);
+        const float32x4_t ns = vcvtq_f32_s32(vreinterpretq_s32_u32(rn));
+        return vmlaq_n_f32(vmlaq_n_f32(vdupq_n_f32(offset), y, scale), ns, noise);
     }
 
-    // Both channels' four oversampled steps (Channel::steps), the filters two lanes wide.
-    SK_NEON_FN void stepsNeon(float (*v)[4], const Stage& a0, const Stage& b0, const Stage& a1, const Stage& b1,
-                              const StepGains& sg) {
+    // One filter's coefficients for both channels as (channel 0, channel 1) pairs, from its Stages (one shared by
+    // both channels, or two back to back: eight fields each).
+    static SK_NEON_FN void loadPairs(const Stage* st, bool shared, float32x2_t& g, float32x2_t& k, float32x2_t& wl,
+                                     float32x2_t& wb, float32x2_t& wh, float32x2_t& grit, float32x2_t& leak,
+                                     uint32x2_t& clk) {
+        const float* p = &st[0].g;
+        const float* p1 = shared ? p : p + 8;
+        const float32x4x2_t lo = vzipq_f32(vld1q_f32(p), vld1q_f32(p1));
+        const float32x4x2_t hi = vzipq_f32(vld1q_f32(p + 4), vld1q_f32(p1 + 4));
+        g = vget_low_f32(lo.val[0]);
+        k = vget_high_f32(lo.val[0]);
+        wl = vget_low_f32(lo.val[1]);
+        wb = vget_high_f32(lo.val[1]);
+        wh = vget_low_f32(hi.val[0]);
+        grit = vget_high_f32(hi.val[0]);
+        leak = vget_low_f32(hi.val[1]);
+        clk = vreinterpret_u32_f32(vget_high_f32(hi.val[1]));
+    }
+
+    // Both channels' filters (Channel::steps' second half) over a segment's 4m oversampled steps: dd in, yy out,
+    // both (left, right) pairs per step. kSweep: new coefficients every base-rate sample, else the segment's own.
+    template <bool kSweep>
+    SK_NEON_FN void filterBlock(const float* dd, float* yy, const Segment& seg, uint32_t m, float invLimit) {
         Channel& c0 = ch_[0];
         Channel& c1 = ch_[1];
-        const float32x4x2_t dz = vzipq_f32(overdriveNeon(c0, v[0], sg), overdriveNeon(c1, v[1], sg));
-        const float32x2_t d[4] = {vget_low_f32(dz.val[0]), vget_high_f32(dz.val[0]), vget_low_f32(dz.val[1]),
-                                  vget_high_f32(dz.val[1])};
-        const float32x2_t gA = pair(a0.g, a1.g), kA = pair(a0.k, a1.k), wlA = pair(a0.wl, a1.wl),
-                          wbA = pair(a0.wb, a1.wb), whA = pair(a0.wh, a1.wh), gritA = pair(a0.grit, a1.grit),
-                          leakA = pair(a0.leak, a1.leak);
-        const float32x2_t gB = pair(b0.g, b1.g), kB = pair(b0.k, b1.k), wlB = pair(b0.wl, b1.wl),
-                          wbB = pair(b0.wb, b1.wb), whB = pair(b0.wh, b1.wh), gritB = pair(b0.grit, b1.grit),
-                          leakB = pair(b0.leak, b1.leak);
-        const uint32x2_t clkA = pair(a0.clk, a1.clk), clkB = pair(b0.clk, b1.clk);
         float32x2_t s1A = pair(c0.svfA.s1, c1.svfA.s1), s2A = pair(c0.svfA.s2, c1.svfA.s2);
         float32x2_t s1B = pair(c0.svfB.s1, c1.svfB.s1), s2B = pair(c0.svfB.s2, c1.svfB.s2);
         float32x2_t heldA = pair(c0.clkA.held, c1.clkA.held), heldB = pair(c0.clkB.held, c1.clkB.held);
         uint32x2_t phA = pair(c0.clkA.phase, c1.clkA.phase), phB = pair(c0.clkB.phase, c1.clkB.phase);
+        float32x2_t gA, kA, wlA, wbA, whA, gritA, leakA, gB, kB, wlB, wbB, whB, gritB, leakB;
+        uint32x2_t clkA, clkB;
+        loadPairs(seg.fa[0], seg.shared[0], gA, kA, wlA, wbA, whA, gritA, leakA, clkA);
+        loadPairs(seg.fb[0], seg.shared[0], gB, kB, wlB, wbB, whB, gritB, leakB, clkB);
         // A lane whose grit is off has grit 0 and a clock increment of 0, so running it is a no-op.
-        const bool onA = a0.grit > 0.f || a1.grit > 0.f, onB = b0.grit > 0.f || b1.grit > 0.f, am = sg.am > 1e-4f;
-        const float32x2_t vdp = vdup_n_f32(SVF::kVdP), one = vdup_n_f32(1.f);
-        float32x2_t out[4];
+        bool onA = seg.fa[0][0].grit > 0.f || (!seg.shared[0] && seg.fa[0][1].grit > 0.f);
+        bool onB = seg.fb[0][0].grit > 0.f || (!seg.shared[0] && seg.fb[0][1].grit > 0.f);
+        const float32x2_t vdp = vdup_n_f32(SVF::kVdP), one = vdup_n_f32(1.f), amIn = vdup_n_f32(2.f * invLimit);
+        float32x2_t g2A = vmla_f32(one, gA, gA), g2B = vmla_f32(one, gB, gB);  // 1 + g^2: den = 1 + g^2 + g ke
+        for (uint32_t k = 0; k < m; ++k, dd += 8, yy += 8) {
+            if (kSweep && k > 0) {
+                loadPairs(seg.fa[k], seg.shared[k], gA, kA, wlA, wbA, whA, gritA, leakA, clkA);
+                loadPairs(seg.fb[k], seg.shared[k], gB, kB, wlB, wbB, whB, gritB, leakB, clkB);
+                onA = seg.fa[k][0].grit > 0.f || (!seg.shared[k] && seg.fa[k][1].grit > 0.f);
+                onB = seg.fb[k][0].grit > 0.f || (!seg.shared[k] && seg.fb[k][1].grit > 0.f);
+                g2A = vmla_f32(one, gA, gA);
+                g2B = vmla_f32(one, gB, gB);
+            }
+            const float parSer = seg.parSer[k], amDepth = seg.am[k];
+            const float32x2_t ps = vdup_n_f32(parSer), depth = vdup_n_f32(amDepth);
+            const float32x2_t mixA = vdup_n_f32(0.5f * (1.f - parSer) * invLimit);
+            const float32x2_t mixB = vdup_n_f32(0.5f * (1.f + parSer) * invLimit);
+            const bool am = amDepth > 1e-4f;
 #pragma GCC unroll 4
-        for (int q = 0; q < 4; ++q) {
-            float32x2_t inA = d[q];
-            if (onA) {
-                const uint32x2_t next = vadd_u32(phA, clkA);
-                heldA = vbsl_f32(vclt_u32(next, phA), inA, heldA);  // the clock ticked
-                phA = next;
-                inA = vmla_f32(inA, gritA, vsub_f32(heldA, inA));
+            for (int q = 0; q < 4; ++q) {
+                const float32x2_t d = vld1_f32(dd + 2 * q);
+                float32x2_t inA = d;
+                if (onA) {
+                    const uint32x2_t next = vadd_u32(phA, clkA);
+                    heldA = vbsl_f32(vclt_u32(next, phA), inA, heldA);  // the clock ticked
+                    phA = next;
+                    inA = vmla_f32(inA, gritA, vsub_f32(heldA, inA));
+                }
+                const float32x2_t keA = vmla_f32(kA, vmul_f32(vdp, s1A), s1A);
+                const float32x2_t keB = vmla_f32(kB, vmul_f32(vdp, s1B), s1B);
+                const float32x2_t denA = vmla_f32(g2A, gA, keA);
+                const float32x2_t denB = vmla_f32(g2B, gB, keB);
+                const float32x2_t inv = reciprocal(vmul_f32(denA, denB));
+                const float32x2_t hpA = vmul_f32(vsub_f32(vmls_f32(inA, vadd_f32(keA, gA), s1A), s2A), vmul_f32(inv, denB));
+                const float32x2_t v1A = vmul_f32(gA, hpA);
+                const float32x2_t bpA = vadd_f32(v1A, s1A);
+                s1A = vadd_f32(bpA, v1A);
+                const float32x2_t v2A = vmul_f32(gA, bpA);
+                const float32x2_t lpA = vadd_f32(v2A, s2A);
+                s2A = vadd_f32(lpA, v2A);
+                float32x2_t ya = vmla_f32(vmla_f32(vmul_f32(wlA, lpA), wbA, bpA), whA, hpA);
+                if (onA) ya = vmla_f32(ya, leakA, clockSquare2(phA));
+                float32x2_t inB = vmla_f32(d, ps, vsub_f32(ya, d));
+                if (onB) {
+                    const uint32x2_t next = vadd_u32(phB, clkB);
+                    heldB = vbsl_f32(vclt_u32(next, phB), inB, heldB);
+                    phB = next;
+                    inB = vmla_f32(inB, gritB, vsub_f32(heldB, inB));
+                }
+                const float32x2_t hpB = vmul_f32(vsub_f32(vmls_f32(inB, vadd_f32(keB, gB), s1B), s2B), vmul_f32(inv, denA));
+                const float32x2_t v1B = vmul_f32(gB, hpB);
+                const float32x2_t bpB = vadd_f32(v1B, s1B);
+                s1B = vadd_f32(bpB, v1B);
+                const float32x2_t v2B = vmul_f32(gB, bpB);
+                const float32x2_t lpB = vadd_f32(v2B, s2B);
+                s2B = vadd_f32(lpB, v2B);
+                float32x2_t yb = vmla_f32(vmla_f32(vmul_f32(wlB, lpB), wbB, bpB), whB, hpB);
+                if (onB) yb = vmla_f32(yb, leakB, clockSquare2(phB));
+                float32x2_t y = vmla_f32(vmul_f32(ya, mixA), mixB, yb);
+                if (am) y = vmul_f32(y, vmla_f32(one, depth, softClip2(vmul_f32(yb, amIn))));
+                vst1_f32(yy + 2 * q, safetyLimit2(y));
             }
-            const float32x2_t keA = vmla_f32(kA, vmul_f32(vdp, s1A), s1A);
-            const float32x2_t keB = vmla_f32(kB, vmul_f32(vdp, s1B), s1B);
-            const float32x2_t denA = vmla_f32(one, gA, vadd_f32(gA, keA));
-            const float32x2_t denB = vmla_f32(one, gB, vadd_f32(gB, keB));
-            const float32x2_t inv = reciprocal(vmul_f32(denA, denB));
-            const float32x2_t hpA = vmul_f32(vsub_f32(vmls_f32(inA, vadd_f32(keA, gA), s1A), s2A), vmul_f32(inv, denB));
-            const float32x2_t v1A = vmul_f32(gA, hpA);
-            const float32x2_t bpA = vadd_f32(v1A, s1A);
-            s1A = vadd_f32(bpA, v1A);
-            const float32x2_t v2A = vmul_f32(gA, bpA);
-            const float32x2_t lpA = vadd_f32(v2A, s2A);
-            s2A = vadd_f32(lpA, v2A);
-            float32x2_t ya = vmla_f32(vmla_f32(vmul_f32(wlA, lpA), wbA, bpA), whA, hpA);
-            if (onA) ya = vmla_f32(ya, leakA, clockSquare2(phA));
-            float32x2_t inB = vmla_f32(d[q], vdup_n_f32(sg.parSer), vsub_f32(ya, d[q]));
-            if (onB) {
-                const uint32x2_t next = vadd_u32(phB, clkB);
-                heldB = vbsl_f32(vclt_u32(next, phB), inB, heldB);
-                phB = next;
-                inB = vmla_f32(inB, gritB, vsub_f32(heldB, inB));
-            }
-            const float32x2_t hpB = vmul_f32(vsub_f32(vmls_f32(inB, vadd_f32(keB, gB), s1B), s2B), vmul_f32(inv, denA));
-            const float32x2_t v1B = vmul_f32(gB, hpB);
-            const float32x2_t bpB = vadd_f32(v1B, s1B);
-            s1B = vadd_f32(bpB, v1B);
-            const float32x2_t v2B = vmul_f32(gB, bpB);
-            const float32x2_t lpB = vadd_f32(v2B, s2B);
-            s2B = vadd_f32(lpB, v2B);
-            float32x2_t yb = vmla_f32(vmla_f32(vmul_f32(wlB, lpB), wbB, bpB), whB, hpB);
-            if (onB) yb = vmla_f32(yb, leakB, clockSquare2(phB));
-            float32x2_t yy = vmla_f32(vmul_n_f32(ya, sg.mixA), vdup_n_f32(sg.mixB), yb);
-            if (am) yy = vmul_f32(yy, vmla_f32(one, vdup_n_f32(sg.am), softClip2(vmul_n_f32(yb, sg.amIn))));
-            out[q] = safetyLimit2(yy);
         }
-        const float32x4x2_t o = vuzpq_f32(vcombine_f32(out[0], out[1]), vcombine_f32(out[2], out[3]));
-        vst1q_f32(v[0], o.val[0]);
-        vst1q_f32(v[1], o.val[1]);
         c0.svfA.s1 = vget_lane_f32(s1A, 0); c1.svfA.s1 = vget_lane_f32(s1A, 1);
         c0.svfA.s2 = vget_lane_f32(s2A, 0); c1.svfA.s2 = vget_lane_f32(s2A, 1);
         c0.svfB.s1 = vget_lane_f32(s1B, 0); c1.svfB.s1 = vget_lane_f32(s1B, 1);
@@ -1181,9 +1388,35 @@ private:
         // The clock sampler only acts while the clock is under the oversampled Nyquist; fade it out
         // just before so a cutoff sweep across that point doesn't click.
         st.grit = grit * clampf((0.5f - clk) * 10.f, 0.f, 1.f);
-        st.leak = st.grit * 0.002f * limit_;  // the bleed is the same with or without LIMIT
+        // The clock's own bleed, the same with or without LIMIT. It is heard only while the clock itself is audible
+        // (fading out from 10 to 20 kHz, i.e. cutoffs above ~200-400 Hz at 50:1): higher, the real one is
+        // ultrasonic, and a square wave up there would only alias down into a whine.
+        st.leak = st.grit * 0.002f * limit_ * clampf((bleedTop_ - clk) * bleedSlope_, 0.f, 1.f);
         st.clk = st.grit > 0.f ? static_cast<uint32_t>(clk * 4294967296.f) : 0u;  // clk < 0.5 here
         return st;
+    }
+
+    static bool quiet(const float* x, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i)
+            if (!(std::fabs(x[i]) < kQuietIn)) return false;
+        return true;
+    }
+    bool unchangedSinceSleep() const {
+        for (int i = 0; i < kNumParams; ++i)
+            if (norm_[i] != sleepNorm_[i]) return false;
+        return true;
+    }
+    bool canSleep() const {
+        return numMoving_ == 0 && cur_[sK1] > kNoSelfOsc && cur_[sK2] > kNoSelfOsc && envStage_ == kIdle &&
+               std::fabs(env_) < 1e-4f && manualHold_ == 0 && !gate_ && lfoDeclick_ == 0.f;
+    }
+    // Asleep: the LFO keeps its pace and the level detector keeps falling, so waking up finds them where they
+    // would have been.
+    void doze(uint32_t n, float lfoInc) {
+        lfoPhase_ += static_cast<float>(n) * lfoInc;
+        lfoPhase_ -= std::floor(lfoPhase_);
+        lfo_ = lfoShape_ == kSaw ? 2.f * lfoPhase_ - 1.f : sinCycle(lfoPhase_);
+        det_ *= std::exp(static_cast<float>(n) * detFallLog_);
     }
 
     void rescaleFilters(float r) {
@@ -1214,12 +1447,17 @@ private:
     Downsampler2x<kL1> down1_;
     float fs_ = 44100.f, fsOs_ = 176400.f, dcR_ = 0.9993f, eqA_ = 0.3f;
     float detAtk_ = 0.f, detRel_ = 0.f, uOff_ = 0.f, uLo_ = 0.f;
+    float bleedTop_ = 0.f, bleedSlope_ = 0.f;  // the clock bleed's fade, in clock periods per oversampled step
     float glideRestart_ = 0.f, glideShape_ = 0.f, lfoGlide_ = 0.f;  // per-sample decay of the LFO's offset
     float env_ = 0, det_ = 0, lfoPhase_ = 0, lfo_ = 0, lfoDeclick_ = 0, limit_ = 1.f;
     EnvStage envStage_ = kIdle;
     int lfoShape_ = kSine;
     bool gate_ = false, lfoJump_ = false;
     bool neon_ = false;
+    bool asleep_ = false;
+    uint32_t quietRun_ = 0;            // samples of silent input in a row
+    float sleepNorm_[kNumParams] = {};  // the parameters when it fell asleep
+    float detFallLog_ = 0.f;           // log(1 - detRel_): the detector's fall per sample, for doze()
     int manualHold_ = 0;
 };
 

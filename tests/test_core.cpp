@@ -136,7 +136,10 @@ double clickRatio(const Settings& base, const Settings& change, double hz = 220)
 
 // The LFO's biggest per-sample step across a change made after 50 ms (processed one sample at a time), and its
 // value 20 ms after the change.
-std::pair<double, double> lfoJump(const Settings& base, const Settings& change) {
+struct LfoJump {
+    double step, after;
+};
+LfoJump lfoJump(const Settings& base, const Settings& change) {
     sk::ShermanCore c;
     configure(c, clean(base));
     float l = 0, r = 0, prev = 0, worst = 0, after = 0;
@@ -369,7 +372,7 @@ int main() {
         check(flip < 1.5, "LFO F2 inverted mid-note: no click", flip);
         const Settings sweep = {{sk::kLfoDepth, lfoDepthParam(3)}, {sk::kLfoSpeed, 0.2f}, {sk::kFreq1, hzToParam(800)},
                                 {sk::kReso1, 0.5f}, {sk::kLbh1, 0.5f}};
-        const double shapeLfo = lfoJump(sweep, {{sk::kLfoShape, opt(sk::kSaw, 3)}}).first;
+        const double shapeLfo = lfoJump(sweep, {{sk::kLfoShape, opt(sk::kSaw, 3)}}).step;
         const double shapeOut = clickRatio(sweep, {{sk::kLfoShape, opt(sk::kSaw, 3)}});
         check(shapeLfo < 0.01 && shapeOut < 3, "LFO shape sine -> saw glides (biggest LFO step)", shapeLfo);
         // At 7.07 Hz the LFO is at 0.81 when TRIG restarts it 50 ms in; 20 ms later it reads sin(2 pi 7.07 0.02) =
@@ -377,7 +380,8 @@ int main() {
         Settings trig = sweep;
         trig.push_back({sk::kLfoShape, opt(sk::kSineTrig, 3)});
         trig.push_back({sk::kLfoSpeed, 0.5f});
-        const auto [restartStep, restartAfter] = lfoJump(trig, {});
+        const LfoJump restart = lfoJump(trig, {});
+        const double restartStep = restart.step, restartAfter = restart.after;
         check(restartStep < 0.05 && std::fabs(restartAfter - 0.776) < 0.05,
               "SINE TRIG restart: restarts, no jump in the LFO (biggest step)", restartStep);
         const double knob = clickRatio({{sk::kFreq1, hzToParam(200)}, {sk::kReso1, 0.7f}}, {{sk::kFreq1, hzToParam(5000)}});
@@ -386,6 +390,56 @@ int main() {
         const double mix = clickRatio({{sk::kFreq1, hzToParam(300)}}, {{sk::kBypEff, 0.f}});
         check(knob < 2 && blend < 1.5 && mix < 1.5, "Freq jump, Par/Ser and Byp/Eff glide (worst step ratio)",
               std::max({knob, blend, mix}));
+    }
+    {   // Sleep: after a few ms of silence with nothing sounding, the DSP stops and the output is exactly zero. Input,
+        // a parameter change or TRIG wake it; waking finds the filters at rest, so it sounds like a fresh start.
+        auto quietFor = [&](sk::ShermanCore& c, int blocks) {
+            std::vector<float> l(128, 0.f), r(128, 0.f);
+            float peak = 0;
+            for (int b = 0; b < blocks; ++b) {
+                std::fill(l.begin(), l.end(), 0.f);
+                std::fill(r.begin(), r.end(), 0.f);
+                c.process(l.data(), r.data(), l.data(), r.data(), 128);
+                for (float v : l) peak = std::max(peak, std::fabs(v));
+            }
+            return peak;
+        };
+        sk::ShermanCore c;
+        configure(c, {});  // Init: grit on, filter 1 at 1.21 kHz (its clock is ultrasonic: no bleed)
+        quietFor(c, 3);
+        const float slept = quietFor(c, 100);
+        check(c.asleep() && slept == 0.f, "Silence: Init falls asleep, output exactly 0", slept);
+        auto in = sine(330, 0.3f, 8192);
+        sk::ShermanCore fresh;
+        configure(fresh, {});
+        auto ref = in, refR = in, l = in, r = in;
+        double diff = 0;
+        for (size_t i = 0; i < in.size(); i += 128) {
+            c.process(&l[i], &r[i], &l[i], &r[i], 128);
+            fresh.process(&ref[i], &refR[i], &ref[i], &refR[i], 128);
+        }
+        for (size_t i = 0; i < in.size(); ++i) diff = std::max(diff, double(std::fabs(l[i] - ref[i])));
+        check(!c.asleep() && diff < 1e-4, "Input wakes it, sounding like a fresh start (max diff)", diff);
+        quietFor(c, 200);
+        const bool napping = c.asleep();
+        c.setParam(sk::kReso2, 1.f);  // a parameter change wakes it: filter 2 now oscillates on its own
+        c.setParam(sk::kFreq2, hzToParam(440));
+        std::vector<float> sl(2 * n - (2 * n) % 128, 0.f), sr(sl);  // whole blocks
+        for (size_t i = 0; i < sl.size(); i += 128) c.process(&sl[i], &sr[i], &sl[i], &sr[i], 128);
+        check(napping && !c.asleep() && rms(sl, n) > 0.3, "A parameter change wakes it; self-oscillation never sleeps",
+              rms(sl, n));
+        sk::ShermanCore t;
+        configure(t, clean({{sk::kAttack, 0.f}}));
+        quietFor(t, 50);
+        const bool before = t.asleep();
+        t.trigger();
+        float l1 = 0, r1 = 0;
+        t.process(&l1, &r1, &l1, &r1, 1);
+        check(before && !t.asleep() && t.envelope() > 0.f, "TRIG wakes it and fires the envelope", t.envelope());
+        sk::ShermanCore g;
+        configure(g, {{sk::kGrit, 1.f}, {sk::kFreq1, hzToParam(100)}});  // clock at 5 kHz: its bleed is audible
+        const float bleed = quietFor(g, 400);
+        check(!g.asleep() && bleed > 1e-3f, "An audible clock bleed keeps it awake (grit 1, 100 Hz cutoff)", bleed);
     }
 #if SK_NEON
     {   // On ARM: the NEON path (picked at load time) and the plain one agree to rounding.
