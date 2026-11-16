@@ -191,10 +191,19 @@ int main(int argc, char** argv) {
           display(a, sk::kHarmonics).c_str(), display(a, sk::kFreq2).c_str());
     a->setParameter(a, sk::kHarmonics, 3.f / 11.f + 1.f / 128.f);
     CHECK(display(a, sk::kHarmonics) == "1:3", "a nudge up steps one ratio -> \"%s\"", display(a, sk::kHarmonics).c_str());
+    a->setParameter(a, sk::kHarmonics, 3.f / 11.f - 1.f / 128.f);
+    CHECK(display(a, sk::kHarmonics) == "1:2", "a nudge down steps back -> \"%s\"", display(a, sk::kHarmonics).c_str());
     a->setParameter(a, sk::kHarmonics, 0.f);
-    a->setParameter(a, sk::kEnvMode, 1.f - 1.f / 128.f);
+    a->setParameter(a, sk::kEnvMode, 1.f / 128.f);
     CHECK(display(a, sk::kEnvMode) == "AR", "env mode nudge from ADSR -> \"%s\"", display(a, sk::kEnvMode).c_str());
     a->setParameter(a, sk::kEnvMode, 0.f);
+    a->setParameter(a, sk::kEnvMode, 1.f - 1.f / 128.f);
+    CHECK(display(a, sk::kEnvMode) == "Follow", "a jump from ADSR to near the top lands on the nearest -> \"%s\"",
+          display(a, sk::kEnvMode).c_str());
+    a->setParameter(a, sk::kEnvMode, 0.f);
+    a->setParameter(a, sk::kHarmonics, 0.9f);
+    CHECK(display(a, sk::kHarmonics) == "1:12", "harmonics Free -> 0.9 (a fast sweep) -> \"%s\"", display(a, sk::kHarmonics).c_str());
+    a->setParameter(a, sk::kHarmonics, 0.f);
     a->setParameter(a, sk::kFreq1, 0.25f);
     CHECK(std::fabs(a->getParameter(a, sk::kFreq1) - 0.25f) < 1e-6f &&
           std::fabs(b->getParameter(b, sk::kFreq1) - sk::kDefaults[sk::kFreq1]) < 1e-6f, "set/get round trip; instance b unaffected");
@@ -216,8 +225,9 @@ int main(int argc, char** argv) {
     const size_t firstBlock = gAutomated.size();
     const int updatesFirst = gUpdates;
     idle(a, 4);
-    CHECK(firstBlock == 8 && updatesFirst == 0 && gAutomated.size() >= size_t(kNumSound) && gUpdates == 1,
-          "the host hears the %zu changes 8 per block, then one display update", gAutomated.size());
+    CHECK(firstBlock == 8 && updatesFirst == 0 && gAutomated.size() >= size_t(kNumSound) && gUpdates == 0,
+          "the host hears the %zu changes 8 per block, and no display update (it would close the PRESET menu: %d)",
+          gAutomated.size(), gUpdates);
     a->setParameter(a, sk::kReso1, 0.5f);
     a->dispatcher(a, 2, 0, 1, nullptr, 0);  // the same program again
     CHECK(std::fabs(a->getParameter(a, sk::kReso1) - 0.5f) < 1e-6f, "re-picking the current program keeps the tweaks");
@@ -232,17 +242,21 @@ int main(int argc, char** argv) {
     a->setParameter(a, sk::kFreq1, 0.3f);
     a->setParameter(a, sk::kHarmonics, 5.f / 11.f);
     gAutomated.clear();
-    press(a, kSave);
-    CHECK(fileExists(slot1) && display(a, kStatus) == "Saved User 01" && display(a, kPreset) == "User 01",
-          "SAVE writes user_01.skfb (status \"%s\")", display(a, kStatus).c_str());
+    gUpdates = 0;
+    press(a, kSave);  // setParameter and process calls only: MPC's audio thread
+    CHECK(!fileExists(slot1) && gUpdates == 1, "SAVE touches no file on the audio thread, asks for one display update (%d)", gUpdates);
+    CHECK(display(a, kStatus) == "Saved User 01" && display(a, kPreset) == "User 01" && fileExists(slot1),
+          "the host re-reading the texts (UI thread) writes user_01.skfb (status \"%s\")", display(a, kStatus).c_str());
     bool released = false;
     for (auto& m : gAutomated) released |= m.index == kSave && m.value == 0.f;
     CHECK(released && a->getParameter(a, kSave) == 0.f, "the SAVE button springs back (host told 0)");
     a->setParameter(a, sk::kFreq1, 0.9f);
     a->setParameter(a, sk::kHarmonics, 0.f);
+    std::rename(slot1.c_str(), (slot1 + ".away").c_str());  // LOAD must not need the file: it reads memory
     press(a, kLoad);
+    std::rename((slot1 + ".away").c_str(), slot1.c_str());
     CHECK(std::fabs(a->getParameter(a, sk::kFreq1) - 0.3f) < 2e-6f && std::fabs(a->getParameter(a, sk::kHarmonics) - 5.f / 11.f) < 2e-6f &&
-          a->dispatcher(a, 3, 0, 0, nullptr, 0) == kFactory, "LOAD brings the saved sound back (program = User 01)");
+          a->dispatcher(a, 3, 0, 0, nullptr, 0) == kFactory, "LOAD brings the saved sound back from memory (program = User 01)");
     b->dispatcher(b, 2, 0, kFactory, nullptr, 0);
     CHECK(std::fabs(b->getParameter(b, sk::kFreq1) - 0.3f) < 2e-6f, "another instance loads User 01 from MPC's PRESET menu");
     a->setParameter(a, kPreset, 2.f / (kPrograms - 1));
@@ -255,6 +269,31 @@ int main(int argc, char** argv) {
     CHECK(display(a, kPreset) == "Acid Squelch", "PREV steps back -> \"%s\"", display(a, kPreset).c_str());
     press(a, kLoad);
     CHECK(std::fabs(a->getParameter(a, sk::kReso1) - 0.85f) < 1e-6f, "LOAD of a factory preset from the page");
+    {   // Display updates (the host rebuilds the page and closes its PRESET menu) only for texts the host can't tell
+        // from a value: none for TRIG, the selector or a program from the menu; one when Freq 2 locks or unlocks.
+        idle(a, 8);
+        gUpdates = 0;
+        press(a, kTrig);
+        const int afterTrig = gUpdates;
+        a->setParameter(a, kPreset, 5.f / (kPrograms - 1));
+        idle(a, 2);
+        const int afterSelector = gUpdates;
+        a->setParameter(a, sk::kHarmonics, 3.f / 11.f);  // Free -> 1:2: Freq 2 reads "Locked"
+        idle(a, 2);
+        const int afterLock = gUpdates;
+        a->setParameter(a, sk::kHarmonics, 4.f / 11.f);  // still locked
+        idle(a, 2);
+        const int afterRatio = gUpdates;
+        a->setParameter(a, sk::kHarmonics, 0.f);
+        idle(a, 2);
+        const int afterUnlock = gUpdates;
+        a->dispatcher(a, 2, 0, 3, nullptr, 0);  // Twin Notch Sweep from the menu: locks Freq 2 too
+        idle(a, 8);
+        CHECK(afterTrig == 0 && afterSelector == 0 && afterLock == 1 && afterRatio == 1 && afterUnlock == 2 && gUpdates == 2 &&
+              display(a, sk::kFreq2) == "Locked",
+              "display updates: TRIG %d, selector %d, lock %d, ratio %d, unlock %d, menu program %d",
+              afterTrig, afterSelector, afterLock, afterRatio, afterUnlock, gUpdates);
+    }
 
     {   // TRIG: a quiet tone stays under the trigger level; the button fires the envelope and opens filter 1.
         setClean(a);
@@ -399,22 +438,218 @@ int main(int argc, char** argv) {
         CHECK(std::fabs(g) < 0.5, "48 kHz: 1 kHz passes at %.2f dB", g);
     }
 
-    {   // On the device there is no override: presets go to presets/ next to the .so, found via /proc/self/maps.
+    {   // MPC nudges parameter 0 (Input) to 1.0 or 0.0 and straight back when it prepares the plugin (older OS
+        // versions also on STOP), possibly while audio runs: neither a +40 dB burst nor a dropout may be heard.
+        a->dispatcher(a, 12, 0, 0, nullptr, 0);
+        a->dispatcher(a, 10, 0, 0, nullptr, 44100.f);
+        setClean(a);
+        a->dispatcher(a, 12, 0, 1, nullptr, 0);
+        auto l = sine(44100.0 / 64, 0.1f, 128 * 80), r = l;  // two whole cycles per block: every block's RMS equal
+        const float in0 = a->getParameter(a, sk::kInput);
+        double baseHi = 0, baseLo = 1e9, hi = 0, lo = 1e9;
+        for (size_t blk = 0; blk < 80; ++blk) {
+            if (blk == 40) a->setParameter(a, sk::kInput, 1.f);
+            if (blk == 41) a->setParameter(a, sk::kInput, in0);
+            if (blk == 60) a->setParameter(a, sk::kInput, 0.f);
+            if (blk == 61) a->setParameter(a, sk::kInput, in0);
+            float* io[2] = {&l[blk * 128], &r[blk * 128]};
+            a->processReplacing(a, io, io, 128);
+            double s = 0;
+            for (size_t i = blk * 128; i < blk * 128 + 128; ++i) s += double(l[i]) * l[i];
+            const double level = std::sqrt(s / 128);
+            if (blk >= 20 && blk < 40) baseHi = std::max(baseHi, level), baseLo = std::min(baseLo, level);
+            if (blk >= 40) hi = std::max(hi, level), lo = std::min(lo, level);
+        }
+        CHECK(hi < 1.02 * baseHi && lo > 0.98 * baseLo, "parameter 0 nudged to 1 and to 0 for a block each: %+.2f / %+.2f dB",
+              20 * std::log10(hi / baseHi), 20 * std::log10(lo / baseLo));
+        a->setParameter(a, sk::kInput, 1.f);  // a real move to the end still lands, a block later
+        idle(a, 3);
+        auto loud = run(a, sine(44100.0 / 64, 0.01f, 128 * 40));
+        CHECK(rms(loud, 128 * 30) > 10 * 0.01 / std::sqrt(2.0), "Input turned fully up does take effect (%.1f dB)",
+              20 * std::log10(rms(loud, 128 * 30) / (0.01 / std::sqrt(2.0))));
+    }
+    {   // The load sequence of MPC's host (Akai's host contract), restoring a project's state, then audio in place in
+        // every block size MPC offers (32..512 frames; the announced size is the most it sends) and some odd ones.
+        a->dispatcher(a, 2, 0, 4, nullptr, 0);  // Stereo Wobble...
+        a->setParameter(a, sk::kReso1, 0.31f);   // ...tweaked: the project's sound
+        void* data = nullptr;
+        const intptr_t len = a->dispatcher(a, 23, 0, 0, &data, 0);
+        std::vector<char> state(static_cast<char*>(data), static_cast<char*>(data) + len);
+        AEffect* m = entry(host);
+        m->dispatcher(m, 10, 0, 0, nullptr, 44100.f);
+        m->dispatcher(m, 11, 0, 512, nullptr, 0);
+        m->dispatcher(m, 0, 0, 0, nullptr, 0);  // effOpen
+        int autom = 0;
+        for (int i = 0; i < kNumVst; ++i) autom += m->dispatcher(m, 26, i, 0, nullptr, 0) != 0;
+        char bypass[] = "bypass", midi[] = "receiveVstMidiEvent";
+        const intptr_t byp = m->dispatcher(m, 51, 0, 0, bypass, 0);
+        m->dispatcher(m, 10, 0, 0, nullptr, 44100.f);
+        m->dispatcher(m, 11, 0, 512, nullptr, 0);
+        char vendor[64] = {};
+        m->dispatcher(m, 47, 0, 0, vendor, 0);
+        m->dispatcher(m, 0, 0, 0, nullptr, 0);  // effOpen, a second time
+        m->dispatcher(m, 2, 0, 0, nullptr, 0);  // program 0
+        const intptr_t cat = m->dispatcher(m, 35, 0, 0, nullptr, 0);
+        int names = 0;
+        for (int i = 0; i < kPrograms; ++i) names += !programName(m, i).empty();
+        const intptr_t midiIn = m->dispatcher(m, 51, 0, 0, midi, 0);
+        const int latency = m->initialDelay;
+        const intptr_t restored = m->dispatcher(m, 24, 0, len, state.data(), 0);  // the project's state
+        m->dispatcher(m, 2, 0, 4, nullptr, 0);                                    // and its program number
+        m->dispatcher(m, 10, 0, 0, nullptr, 44100.f);                             // prepare to play
+        m->dispatcher(m, 11, 0, 512, nullptr, 0);
+        m->dispatcher(m, 12, 0, 1, nullptr, 0);
+        const float p0 = m->getParameter(m, 0);
+        m->setParameter(m, 0, p0 < 0.5f ? 1.f : 0.f);  // the parameter 0 nudge
+        m->setParameter(m, 0, p0);
+        int same = 0;
+        for (int i = 0; i < kNumSound; ++i) same += std::fabs(m->getParameter(m, i) - a->getParameter(a, i)) < 2e-6f;
+        CHECK(autom == kNumSound && byp <= 0 && !std::strcmp(vendor, "Sher Khan") && cat == 1 && names == kPrograms &&
+              midiIn <= 0 && latency == sk::ShermanCore::kLatency && restored == 1,
+              "MPC's load sequence: %d automatable, bypass %ld, %d program names, latency %d", autom,
+              static_cast<long>(byp), names, latency);
+        CHECK(same == kNumSound && m->dispatcher(m, 3, 0, 0, nullptr, 0) == 4,
+              "after the whole sequence the project's sound is intact (%d/%d, program %ld)", same, kNumSound,
+              static_cast<long>(m->dispatcher(m, 3, 0, 0, nullptr, 0)));
+        setClean(m);
+        m->setParameter(m, sk::kFreq1, 0.45f);
+        m->setParameter(m, sk::kReso1, 0.6f);
+        m->setParameter(m, sk::kInput, 0.7f);
+        uint32_t x = 5;
+        std::vector<float> noise(44100 / 4);
+        for (auto& v : noise) x = x * 1664525u + 1013904223u, v = 0.5f * ((x >> 8) * (1.f / 8388608.f) - 1.f);
+        auto inBlocks = [&](int block) {  // processes noise in place in blocks of `block` frames, from a reset
+            m->dispatcher(m, 12, 0, 1, nullptr, 0);
+            std::vector<float> l(noise), r(noise);
+            for (size_t i = 0; i < l.size(); i += block) {
+                const int32_t n = static_cast<int32_t>(std::min<size_t>(block, l.size() - i));
+                float* io[2] = {&l[i], &r[i]};
+                m->processReplacing(m, io, io, n);
+            }
+            return l;
+        };
+        idle(m, 40);  // glides done
+        const auto ref = inBlocks(128);
+        double worst = 0;
+        int worstBlock = 0;
+        bool finite = true;
+        for (int block : {32, 64, 96, 192, 256, 512, 1, 7, 33, 300}) {
+            const auto out = inBlocks(block);
+            for (size_t i = 0; i < out.size(); ++i) {
+                finite &= std::isfinite(out[i]);
+                if (std::fabs(out[i] - ref[i]) > worst) worst = std::fabs(out[i] - ref[i]), worstBlock = block;
+            }
+        }
+        CHECK(finite && worst < 1e-5 && rms(ref, 0) > 0.01, "blocks of 1..512 frames give the 128-frame output (worst %.1e at %d)",
+              worst, worstBlock);
+        m->dispatcher(m, 1, 0, 0, nullptr, 0);
+    }
+    {   // Every value text fits under a knob: 8 characters (MPC shows them in upper case); switches 9.
+        uint32_t x = 99;
+        auto rnd = [&x] { x = x * 1664525u + 1013904223u; return (x >> 8) * (1.f / 16777216.f); };
+        int tooLong = 0;
+        std::string worst;
+        for (int it = 0; it < 6000; ++it) {
+            const int i = it % kNumSound;
+            const float v = it < kNumSound * 5 ? static_cast<float>(it / kNumSound) * 0.25f : rnd();
+            a->setParameter(a, i, v);
+            const std::string t = display(a, i);
+            if (t.empty() || t.size() > (sk::kOptionCount[i] ? 9u : 8u)) ++tooLong, worst = t;
+        }
+        CHECK(tooLong == 0, "value texts fit (%d too long, e.g. \"%s\")", tooLong, worst.c_str());
+    }
+    {   // State round trips for random sounds; every truncation of a real chunk and random junk is handled (no crash,
+        // every value stays in 0..1).
+        uint32_t x = 1234;
+        auto rnd = [&x] { x = x * 1664525u + 1013904223u; return (x >> 8) * (1.f / 16777216.f); };
+        int exact = 0;
+        for (int it = 0; it < 200; ++it) {
+            for (int i = 0; i < kNumSound; ++i) a->setParameter(a, i, rnd());
+            void* d = nullptr;
+            const intptr_t len = a->dispatcher(a, 23, 0, 0, &d, 0);
+            std::vector<char> c(static_cast<char*>(d), static_cast<char*>(d) + len);
+            b->dispatcher(b, 24, 0, len, c.data(), 0);
+            int same = 0;
+            for (int i = 0; i < kNumSound; ++i) same += std::fabs(a->getParameter(a, i) - b->getParameter(b, i)) < 2e-6f;
+            exact += same == kNumSound;
+        }
+        CHECK(exact == 200, "200 random sounds survive the project round trip (%d)", exact);
+        void* d = nullptr;
+        const intptr_t len = a->dispatcher(a, 23, 0, 0, &d, 0);
+        const std::string real(static_cast<char*>(d), static_cast<size_t>(len));
+        bool sane = true;
+        auto saneValues = [&] {
+            for (int i = 0; i < kNumSound; ++i) {
+                const float v = b->getParameter(b, i);
+                sane &= std::isfinite(v) && v >= 0.f && v <= 1.f;
+            }
+            sane &= b->dispatcher(b, 3, 0, 0, nullptr, 0) >= 0 && b->dispatcher(b, 3, 0, 0, nullptr, 0) < kPrograms;
+        };
+        for (intptr_t cut = 1; cut < len; ++cut) {
+            std::vector<char> c(real.begin(), real.begin() + cut);  // no terminator
+            b->dispatcher(b, 24, 0, cut, c.data(), 0);
+            saneValues();
+        }
+        for (int it = 0; it < 400; ++it) {
+            std::vector<char> c(1 + static_cast<size_t>(rnd() * 3000));
+            for (auto& ch : c) ch = static_cast<char>(rnd() * 256);
+            if (it % 2) std::memcpy(c.data(), "SKFB2;prog=", std::min<size_t>(11, c.size()));
+            b->dispatcher(b, 24, 0, static_cast<intptr_t>(c.size()), c.data(), 0);
+            saneValues();
+        }
+        idle(b, 4);
+        CHECK(sane, "truncated and junk chunks: no crash, values stay in range");
+    }
+
+    {   // A new process (here: a copy of the .so, which has its own globals) finds the saved slots on disk.
+        auto copyFile = [](const std::string& from, const std::string& to) {
+            FILE* in = std::fopen(from.c_str(), "rb");
+            FILE* out = std::fopen(to.c_str(), "wb");
+            bool ok = in && out;
+            char buf[65536];
+            for (size_t n; ok && (n = std::fread(buf, 1, sizeof buf, in)) > 0;) ok = std::fwrite(buf, 1, n, out) == n;
+            if (in) std::fclose(in);
+            if (out) ok = std::fclose(out) == 0 && ok;
+            return ok;
+        };
+        char t1[] = "/tmp/skfb_copy1_XXXXXX", t2[] = "/tmp/skfb_copy2_XXXXXX";
+        const std::string d1 = mkdtemp(t1), d2 = mkdtemp(t2);
+        const std::string so1 = d1 + "/sk_filterbank.so", so2 = d2 + "/sk_filterbank.so";
+        CHECK(copyFile(argv[1], so1) && copyFile(argv[1], so2), "copies of the .so for fresh processes");
+        void* lib1 = dlopen(so1.c_str(), RTLD_NOW | RTLD_LOCAL);
+        auto entry1 = lib1 ? reinterpret_cast<MainFn>(dlsym(lib1, "VSTPluginMain")) : nullptr;
+        AEffect* c = entry1 ? entry1(host) : nullptr;
+        if (c) {
+            c->setParameter(c, kPreset, float(kFactory) / (kPrograms - 1));
+            c->dispatcher(c, 2, 0, kFactory, nullptr, 0);
+            CHECK(display(c, kPreset) == "User 01" && std::fabs(c->getParameter(c, sk::kFreq1) - 0.3f) < 2e-6f,
+                  "a fresh process reads User 01 back from disk (\"%s\")", display(c, kPreset).c_str());
+            c->dispatcher(c, 1, 0, 0, nullptr, 0);
+        } else {
+            CHECK(false, "load the copy: %s", dlerror());
+        }
+        // On the device there is no override: presets go to presets/ next to the .so, found via /proc/self/maps.
         unsetenv("SKFB_PRESET_DIR");
-        AEffect* c = entry(host);
-        std::string so = argv[1];
-        const size_t slash = so.find_last_of('/');
-        std::string dir = slash == std::string::npos ? std::string(".") : so.substr(0, slash);
-        char real[4096];
-        if (realpath(dir.c_str(), real)) dir = real;
-        const std::string file = dir + "/presets/user_16.skfb";
+        void* lib2 = dlopen(so2.c_str(), RTLD_NOW | RTLD_LOCAL);
+        auto entry2 = lib2 ? reinterpret_cast<MainFn>(dlsym(lib2, "VSTPluginMain")) : nullptr;
+        AEffect* e2 = entry2 ? entry2(host) : nullptr;
+        const std::string file = d2 + "/presets/user_16.skfb";
+        if (e2) {
+            e2->setParameter(e2, kPreset, 1.f);  // the last slot, User 16
+            press(e2, kSave);
+            const bool before = fileExists(file);
+            display(e2, kStatus);
+            CHECK(!before && fileExists(file), "without an override, SAVE writes %s (on the UI thread)", file.c_str());
+            e2->dispatcher(e2, 1, 0, 0, nullptr, 0);
+        } else {
+            CHECK(false, "load the second copy: %s", dlerror());
+        }
         std::remove(file.c_str());
-        c->setParameter(c, kPreset, 1.f);  // the last slot, User 16
-        press(c, kSave);
-        CHECK(fileExists(file), "without an override, SAVE writes %s", file.c_str());
-        std::remove(file.c_str());
-        ::rmdir((dir + "/presets").c_str());
-        c->dispatcher(c, 1, 0, 0, nullptr, 0);
+        ::rmdir((d2 + "/presets").c_str());
+        std::remove(so1.c_str());
+        std::remove(so2.c_str());
+        ::rmdir(d1.c_str());
+        ::rmdir(d2.c_str());
     }
 
     a->dispatcher(a, 1, 0, 0, nullptr, 0);  // effClose frees the instance

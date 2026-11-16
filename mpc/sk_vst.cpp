@@ -1,12 +1,13 @@
-// VST2 effect for the plugin host built into MPC OS standalone (Akai Force, MPC Live/One/X/Key Gen1).
+// VST2 effect for the plugin host built into MPC OS standalone (Akai Force, MPC Live/One/X/Key).
 //
-// MPC's host is JUCE's VST2 loader; it finds VSTPluginMain in a .so listed in MPC.settings (pluginList-arm) and
-// draws the plugin's pages from the skin folder next to it (see mpc/README.md). The VST2 ABI is declared here by
-// hand (no Steinberg SDK), the subset the community ports use on the device: magic 'VstP', processReplacing,
+// MPC's host is a standard VST 2.4 host. From MPC OS 3.10.1 it loads plugins from "VST2 Plugins" folders on a
+// drive (Akai's MPC Plugin Builder SDK format: plugin.json, an arm32 and an arm64 .so, the skin); older versions,
+// 3.10.0 included, only load a .so registered in MPC.settings (pluginList-arm). Same .so either way (see
+// mpc/README.md). The VST2 ABI is declared here by hand (no Steinberg SDK): magic 'VstP', processReplacing,
 // program chunks, programs (MPC's PRESET menu), effect category. Audio stays float end to end.
 //
 // State: every sound parameter (and the preset last picked) goes into the chunk that MPC saves with the project and
-// the track program, so whatever the knobs are at is what the project brings back. Presets: 12 factory sounds and
+// in its .xpl presets, so whatever the knobs are at is what the project brings back. Presets: 12 factory sounds and
 // 16 user slots, listed as VST programs in MPC's PRESET menu and browsable on the plugin's PRESETS page, where
 // SAVE stores the current sound in the selected user slot (a small text file in presets/ next to the .so).
 // Loading a preset while audio runs crossfades from the old sound to the new one (30 ms) instead of gliding every
@@ -17,6 +18,7 @@
 #include "../dsp/ShermanCore.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -65,7 +67,7 @@ constexpr int32_t kPlugCategEffect = 1;
 
 // ---- Identity (keep uid and the parameter order fixed across releases: projects store both) --------------
 constexpr int32_t kUniqueId = 0x53684b66;  // 'ShKf'
-constexpr int32_t kVersion = 3001;         // 0.3.1
+constexpr int32_t kVersion = 4000;         // 0.4.0
 constexpr const char* kName = "SK Filterbank";
 constexpr const char* kVendor = "Sher Khan";
 constexpr const char* kChunkMagic = "SKFB2";  // 0.1.0 wrote SKFB1 with a different parameter set: not read
@@ -193,7 +195,8 @@ void programName(int i, char* out, size_t len) {
     else std::snprintf(out, len, "User %02d", i - kFactory + 1);
 }
 
-// Display text for a sound parameter. Units are part of the text (MPC shows this string as the value).
+// Display text for a sound parameter. Units are part of the text (MPC shows this string as the value, under the
+// knob, in upper case: at most 8 characters fit).
 void formatSound(int id, float n, bool harmonicLock, char* out, size_t len) {
     using namespace sk::map;
     auto freq = [&](float f) {
@@ -211,7 +214,7 @@ void formatSound(int id, float n, bool harmonicLock, char* out, size_t len) {
         case sk::kInputEq: std::snprintf(out, len, "%s", kEqNames[option(n, 3)]); break;
         case sk::kLfoSpeed: {
             const float f = lfoHz(n);
-            if (f < 0.1f) std::snprintf(out, len, "%.0f s/cycle", 1.f / f);
+            if (f < 0.1f) std::snprintf(out, len, "%.0fs/cyc", 1.f / f);
             else if (f < 10.f) std::snprintf(out, len, "%.2f Hz", f);
             else if (f < 1000.f) std::snprintf(out, len, "%.0f Hz", f);
             else std::snprintf(out, len, "%.2f kHz", f / 1000.f);
@@ -239,8 +242,8 @@ void formatSound(int id, float n, bool harmonicLock, char* out, size_t len) {
             if (p == 0) std::snprintf(out, len, "LP");
             else if (p == 100) std::snprintf(out, len, "BP");
             else if (p == 200) std::snprintf(out, len, "HP");
-            else if (p < 100) std::snprintf(out, len, "LP>BP %d%%", p);
-            else std::snprintf(out, len, "BP>HP %d%%", p - 100);
+            else if (p < 100) std::snprintf(out, len, "L>B %d%%", p);
+            else std::snprintf(out, len, "B>H %d%%", p - 100);
             break;
         }
         case sk::kCorr1:
@@ -248,7 +251,7 @@ void formatSound(int id, float n, bool harmonicLock, char* out, size_t len) {
             const int p = static_cast<int>(std::lround(corr(n) * 100.f));
             if (p == 0) std::snprintf(out, len, "Off");
             else if (p < 0) std::snprintf(out, len, "+BP %d%%", -p);
-            else std::snprintf(out, len, "Notch %d%%", p);
+            else std::snprintf(out, len, "-BP %d%%", p);
             break;
         }
         case sk::kHarmonics: std::snprintf(out, len, "%s", kHarmNames[option(n, 12)]); break;
@@ -272,10 +275,22 @@ void formatSound(int id, float n, bool harmonicLock, char* out, size_t len) {
 }
 
 // ---- Plugin instance ------------------------------------------------------------------------------------
+// Threads (MPC's host contract): process runs on the audio thread, and so do parameter changes made from the
+// screen and knobs (the page's buttons included); parameter changes from project/preset loads and automation come
+// from the UI thread, and so does every dispatcher call. Nothing here locks, allocates or does file I/O on the
+// audio thread; files are only touched in dispatcher calls.
 constexpr int kHoldFrames = 5292;  // a pressed button stays lit for ~120 ms, then the host hears it go back to 0
 constexpr int kMaxNotify = 8;      // parameter changes reported to the host per block (a preset load spreads out)
 constexpr float kFadeSeconds = 0.03f;
 constexpr int kScratch = 256;      // frames processed per core call
+constexpr size_t kTextCap = kNumSound * 28 + 64;  // serialized sound, with room to spare
+
+// What the PRESETS page's status line says. The audio thread only stores a code; the text is made when the host
+// asks for it (UI thread).
+enum StatusKind : uint32_t { kStProgram, kStLoaded, kStEmpty, kStSaved, kStPickUser, kStBusy, kStWriteFailed };
+constexpr uint32_t statusCode(StatusKind kind, int program) { return kind << 8 | static_cast<uint32_t>(program); }
+
+bool harmonicLock(float harmonics) { return sk::map::option(harmonics, 12) > 0; }
 
 struct Plugin {
     AEffect fx;
@@ -284,20 +299,22 @@ struct Plugin {
     sk::ShermanCore fading;                   // the sound before a preset load, while it fades out
     int fadeLeft = 0, fadeLength = 1323;      // crossfade frames to go / in all (audio thread)
     float fadeStep = 1.f / 1323.f;            // 1 / fadeLength
-    std::atomic<float> norm[kNumSound];       // the sound; written by the host's UI/automation thread
+    float edgeSeen = -1.f;                    // parameter 0's end value (0 or 1) seen last block (audio thread)
+    float sampleRate = 44100.f;
+    std::atomic<float> norm[kNumSound];       // the sound
     std::atomic<float> pressed[kNumVst];      // momentary buttons: 1 while lit
     std::atomic<int> holdFrames[kNumVst];     // frames until a lit button is reported back to 0
     std::atomic<uint8_t> dirty[kNumVst];      // the host must hear this parameter's new value (preset loads)
     std::atomic<bool> snap{false};            // a chunk was loaded: jump to it instead of gliding
     std::atomic<bool> presetLoaded{false};    // a preset was loaded: crossfade to it
     std::atomic<bool> trigRequest{false};     // TRIG pressed: fire the envelope on the audio thread
-    std::atomic<bool> updateDisplay{false};
+    std::atomic<bool> resetRequest{false};    // resumed: start from silence (done on the audio thread)
+    std::atomic<bool> updateDisplay{false};   // texts changed in a way the host can't tell from the values
+    std::atomic<bool> shownLock{false};       // whether Freq 2 reads "Locked" as the page last showed it
     std::atomic<int> cursor{0};               // the preset selected on the PRESETS page
     std::atomic<int> program{0};              // the preset last loaded (MPC's PRESET menu)
-    std::atomic<uint32_t> userSaved{0};       // bit i: user slot i+1 has a file
-    char presetDir[600] = {};
-    char status[64] = {};
-    char chunk[kNumSound * 28 + 64] = {};
+    std::atomic<uint32_t> status{0};          // statusCode()
+    char chunk[kTextCap] = {};
     float scratch[4][kScratch] = {};          // new sound L/R, old sound L/R
 
     Plugin() {
@@ -307,78 +324,20 @@ struct Plugin {
             holdFrames[i].store(0, std::memory_order_relaxed);
             dirty[i].store(0, std::memory_order_relaxed);
         }
+        shownLock.store(harmonicLock(sk::kDefaults[sk::kHarmonics]), std::memory_order_relaxed);
     }
 };
 
 Plugin* self(AEffect* e) { return static_cast<Plugin*>(e->object); }
 
-void setStatus(Plugin* p, const char* fmt, const char* arg) {
-    std::snprintf(p->status, sizeof p->status, fmt, arg);
-    p->updateDisplay.store(true, std::memory_order_relaxed);
-}
-
-// ---- Preset files ---------------------------------------------------------------------------------------
-// The folder this .so was loaded from, read from /proc/self/maps (dladdr would need GLIBC_2.34 when built with
-// a new glibc, which MPC OS 2.x doesn't have). SKFB_PRESET_DIR overrides the preset folder (tests).
-uintptr_t parseHex(const char*& s) {
-    uintptr_t v = 0;
-    for (;; ++s) {
-        const char c = *s;
-        if (c >= '0' && c <= '9') v = v * 16 + static_cast<uintptr_t>(c - '0');
-        else if (c >= 'a' && c <= 'f') v = v * 16 + static_cast<uintptr_t>(c - 'a' + 10);
-        else return v;
-    }
-}
-
-bool pluginDir(char* out, size_t n) {
-    FILE* f = std::fopen("/proc/self/maps", "r");
-    if (!f) return false;
-    const uintptr_t me = reinterpret_cast<uintptr_t>(&VSTPluginMain);
-    char line[1024];
-    bool ok = false;
-    while (!ok && std::fgets(line, sizeof line, f)) {
-        const char* s = line;
-        const uintptr_t lo = parseHex(s);
-        if (*s != '-') continue;
-        ++s;
-        const uintptr_t hi = parseHex(s);
-        if (me < lo || me >= hi) continue;
-        char* path = std::strchr(line, '/');
-        if (!path) continue;
-        path[std::strcspn(path, "\n")] = 0;
-        char* slash = std::strrchr(path, '/');
-        const size_t len = static_cast<size_t>(slash - path);
-        if (len == 0 || len >= n) continue;
-        std::memcpy(out, path, len);
-        out[len] = 0;
-        ok = true;
-    }
-    std::fclose(f);
-    return ok;
-}
-
-void userPath(const Plugin* p, int slot, char* out, size_t n) {
-    std::snprintf(out, n, "%s/user_%02d.skfb", p->presetDir, slot + 1);
-}
-
-void scanUserSlots(Plugin* p) {
-    uint32_t mask = 0;
-    char path[700];
-    for (int s = 0; s < kUserSlots; ++s) {
-        userPath(p, s, path, sizeof path);
-        if (::access(path, R_OK) == 0) mask |= 1u << s;
-    }
-    p->userSaved.store(mask, std::memory_order_relaxed);
-}
-
 // ---- Serialization: "SKFB2;prog=3;input=550000;..." -- normalized values * 1e6 as integers, so the text never
-// depends on the C locale's decimal separator. The same text is the project chunk and a user preset file.
-size_t serialize(const Plugin* p, char* out, size_t cap, bool withProgram) {
+// depends on the C locale's decimal separator. The same text is the project chunk (with prog) and a user preset
+// file (without).
+size_t serialize(const float* values, int program, char* out, size_t cap) {
     size_t pos = static_cast<size_t>(std::snprintf(out, cap, "%s", kChunkMagic));
-    if (withProgram && pos < cap)
-        pos += static_cast<size_t>(std::snprintf(out + pos, cap - pos, ";prog=%d", p->program.load(std::memory_order_relaxed)));
+    if (program >= 0 && pos < cap) pos += static_cast<size_t>(std::snprintf(out + pos, cap - pos, ";prog=%d", program));
     for (int i = 0; i < kNumSound && pos < cap; ++i) {
-        const long v = std::lround(p->norm[i].load(std::memory_order_relaxed) * 1e6f);
+        const long v = std::lround(values[i] * 1e6f);
         pos += static_cast<size_t>(std::snprintf(out + pos, cap - pos, ";%s=%ld", kParams[i].key, v));
     }
     return pos < cap ? pos : 0;
@@ -396,7 +355,7 @@ long parseInt(const char* s) {
 
 // Parses serialized text into values (defaults for keys it doesn't have). Returns false if it isn't ours.
 bool deserialize(const char* text, size_t size, float* values, int* program) {
-    char buf[kNumSound * 28 + 64];
+    char buf[kTextCap];
     const size_t n = size < sizeof buf - 1 ? size : sizeof buf - 1;
     std::memcpy(buf, text, n);
     buf[n] = 0;
@@ -422,7 +381,150 @@ bool deserialize(const char* text, size_t size, float* values, int* program) {
     return true;
 }
 
-// ---- Preset actions (host UI thread: buttons, the PRESET menu) ---------------------------------------------
+// ---- User presets ---------------------------------------------------------------------------------------------
+// The 16 user slots live in memory, shared by every instance in the process (a sound saved on one track loads on
+// another). They are read from presets/ next to the .so when the first instance is created. SAVE, which MPC
+// delivers on the audio thread like every screen button, only stores into memory; the file is written in the
+// host's next dispatcher call (it asks for the page's texts right after a save), on its UI thread. Each slot is a
+// seqlock: a LOAD never sees half a save, and nothing ever waits.
+struct UserBank {
+    std::atomic<int> state;                    // 0 not read yet, 1 being read, 2 ready
+    std::atomic<uint32_t> saved;               // bit s: slot s holds a sound
+    std::atomic<uint32_t> unwritten;           // bit s: saved in memory since its file was last written
+    std::atomic<bool> writing;                 // a dispatcher call is writing files
+    std::atomic<uint32_t> seq[kUserSlots];     // odd while a save is storing the values
+    std::atomic<float> values[kUserSlots][kNumSound];
+    char dir[600];
+};
+UserBank gBank;  // static storage: zero-initialised, no constructor runs (C++17 atomics are trivial)
+
+// The folder this .so was loaded from, read from /proc/self/maps (dladdr would need GLIBC_2.34 when built with
+// a new glibc, which MPC OS 2.x doesn't have). SKFB_PRESET_DIR overrides the preset folder (tests).
+uintptr_t parseHex(const char*& s) {
+    uintptr_t v = 0;
+    for (;; ++s) {
+        const char c = *s;
+        if (c >= '0' && c <= '9') v = v * 16 + static_cast<uintptr_t>(c - '0');
+        else if (c >= 'a' && c <= 'f') v = v * 16 + static_cast<uintptr_t>(c - 'a' + 10);
+        else return v;
+    }
+}
+
+bool pluginDir(char* out, size_t n) {
+    FILE* f = std::fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    // An internal function: its address is this .so's own, whatever other libraries export (VSTPluginMain could
+    // resolve to another plugin's).
+    const uintptr_t me = reinterpret_cast<uintptr_t>(&parseHex);
+    char line[1024];
+    bool ok = false;
+    while (!ok && std::fgets(line, sizeof line, f)) {
+        const char* s = line;
+        const uintptr_t lo = parseHex(s);
+        if (*s != '-') continue;
+        ++s;
+        const uintptr_t hi = parseHex(s);
+        if (me < lo || me >= hi) continue;
+        char* path = std::strchr(line, '/');
+        if (!path) continue;
+        path[std::strcspn(path, "\n")] = 0;
+        char* slash = std::strrchr(path, '/');
+        const size_t len = static_cast<size_t>(slash - path);
+        if (len == 0 || len >= n) continue;
+        std::memcpy(out, path, len);
+        out[len] = 0;
+        ok = true;
+    }
+    std::fclose(f);
+    return ok;
+}
+
+void userPath(int slot, char* out, size_t n) { std::snprintf(out, n, "%s/user_%02d.skfb", gBank.dir, slot + 1); }
+
+// Reads the user slots from disk, once per process (the first instance; host UI thread).
+void readBank() {
+    int expected = 0;
+    if (!gBank.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) return;
+    const char* override = std::getenv("SKFB_PRESET_DIR");
+    char dir[512];
+    if (override && *override) std::snprintf(gBank.dir, sizeof gBank.dir, "%s", override);
+    else if (pluginDir(dir, sizeof dir)) std::snprintf(gBank.dir, sizeof gBank.dir, "%s/presets", dir);
+    else std::snprintf(gBank.dir, sizeof gBank.dir, "/tmp/sk_filterbank_presets");
+    uint32_t mask = 0;
+    for (int s = 0; s < kUserSlots; ++s) {
+        char path[700], text[kTextCap];
+        userPath(s, path, sizeof path);
+        FILE* f = std::fopen(path, "rb");
+        if (!f) continue;
+        const size_t got = std::fread(text, 1, sizeof text - 1, f);
+        std::fclose(f);
+        float values[kNumSound];
+        if (!deserialize(text, got, values, nullptr)) continue;
+        for (int k = 0; k < kNumSound; ++k) gBank.values[s][k].store(values[k], std::memory_order_relaxed);
+        mask |= 1u << s;
+    }
+    gBank.saved.store(mask, std::memory_order_release);
+    gBank.state.store(2, std::memory_order_release);
+}
+
+enum class Slot { kOk, kEmpty, kBusy };
+
+Slot bankRead(int s, float* values) {  // any thread
+    if (!(gBank.saved.load(std::memory_order_acquire) & (1u << s))) return Slot::kEmpty;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const uint32_t q = gBank.seq[s].load(std::memory_order_acquire);
+        if (q & 1u) continue;
+        for (int k = 0; k < kNumSound; ++k) values[k] = gBank.values[s][k].load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (gBank.seq[s].load(std::memory_order_relaxed) == q) return Slot::kOk;
+    }
+    return Slot::kBusy;  // a save into this slot was being stored all along
+}
+
+bool bankWrite(int s, const float* values) {  // any thread; false if another save holds the slot right now
+    uint32_t q = gBank.seq[s].load(std::memory_order_relaxed);
+    if ((q & 1u) || !gBank.seq[s].compare_exchange_strong(q, q + 1, std::memory_order_relaxed)) return false;
+    std::atomic_thread_fence(std::memory_order_release);
+    for (int k = 0; k < kNumSound; ++k) gBank.values[s][k].store(values[k], std::memory_order_relaxed);
+    gBank.seq[s].store(q + 2, std::memory_order_release);
+    gBank.saved.fetch_or(1u << s, std::memory_order_release);
+    gBank.unwritten.fetch_or(1u << s, std::memory_order_release);
+    return true;
+}
+
+// Writes the slots saved since the last call to their files. Dispatcher calls only (host UI thread): a file is
+// written under a temporary name and renamed, so a crash mid-write never leaves half a preset.
+void flushBank(Plugin* p) {
+    if (!gBank.unwritten.load(std::memory_order_relaxed) || gBank.state.load(std::memory_order_acquire) != 2) return;
+    if (gBank.writing.exchange(true, std::memory_order_acquire)) return;  // another instance is at it
+    const uint32_t todo = gBank.unwritten.exchange(0, std::memory_order_acq_rel);
+    bool dirMade = false;
+    for (int s = 0; s < kUserSlots; ++s) {
+        if (!(todo & (1u << s))) continue;
+        float values[kNumSound];
+        if (bankRead(s, values) != Slot::kOk) {  // being saved again right now: the next call writes it
+            gBank.unwritten.fetch_or(1u << s, std::memory_order_relaxed);
+            continue;
+        }
+        char text[kTextCap], path[700], tmp[720];
+        const size_t len = serialize(values, -1, text, sizeof text);
+        if (!dirMade) dirMade = ::mkdir(gBank.dir, 0755) == 0 || errno == EEXIST;
+        userPath(s, path, sizeof path);
+        std::snprintf(tmp, sizeof tmp, "%s.new", path);
+        FILE* f = dirMade ? std::fopen(tmp, "wb") : nullptr;
+        bool ok = f && len > 0 && std::fwrite(text, 1, len, f) == len;
+        if (f) ok = (std::fclose(f) == 0) && ok;
+        ok = ok && std::rename(tmp, path) == 0;
+        if (!ok) {  // the sound stays saved in memory for this session; say the file failed
+            std::remove(tmp);
+            p->status.store(statusCode(kStWriteFailed, kFactory + s), std::memory_order_relaxed);
+            p->updateDisplay.store(true, std::memory_order_relaxed);
+        }
+    }
+    gBank.writing.store(false, std::memory_order_release);
+}
+
+// ---- Preset actions -------------------------------------------------------------------------------------------
 void applySound(Plugin* p, const float* values) {
     for (int i = 0; i < kNumSound; ++i) {
         p->norm[i].store(values[i], std::memory_order_relaxed);
@@ -430,24 +532,18 @@ void applySound(Plugin* p, const float* values) {
     }
 }
 
-bool loadPreset(Plugin* p, int index) {
+// fromPage: the PRESETS page's LOAD (audio thread), which refreshes the page; otherwise MPC's PRESET menu (UI
+// thread), which a display refresh would close: the changed knobs are reported to the host, nothing else.
+bool loadPreset(Plugin* p, int index, bool fromPage) {
     if (index < 0 || index >= kPrograms) return false;
     float values[kNumSound];
-    char name[32];
-    programName(index, name, sizeof name);
     if (index < kFactory) {
         factoryPreset(index, values);
     } else {
-        char path[700], text[sizeof p->chunk];
-        userPath(p, index - kFactory, path, sizeof path);
-        FILE* f = std::fopen(path, "rb");
-        size_t got = 0;
-        if (f) {
-            got = std::fread(text, 1, sizeof text - 1, f);
-            std::fclose(f);
-        }
-        if (!f || !deserialize(text, got, values, nullptr)) {
-            setStatus(p, "%s is empty", name);
+        const Slot got = bankRead(index - kFactory, values);
+        if (got != Slot::kOk) {
+            p->status.store(statusCode(got == Slot::kEmpty ? kStEmpty : kStBusy, index), std::memory_order_relaxed);
+            if (fromPage) p->updateDisplay.store(true, std::memory_order_relaxed);
             return false;
         }
     }
@@ -455,35 +551,27 @@ bool loadPreset(Plugin* p, int index) {
     p->program.store(index, std::memory_order_relaxed);
     p->cursor.store(index, std::memory_order_relaxed);
     p->dirty[kPresetIdx].store(1, std::memory_order_relaxed);
+    p->status.store(statusCode(kStLoaded, index), std::memory_order_relaxed);
+    if (fromPage) p->updateDisplay.store(true, std::memory_order_relaxed);
+    else p->shownLock.store(harmonicLock(values[sk::kHarmonics]), std::memory_order_relaxed);
     p->presetLoaded.store(true, std::memory_order_release);  // after the values: the audio thread sees them all
-    setStatus(p, "Loaded %s", name);
     return true;
 }
 
-bool savePreset(Plugin* p, int index) {
+bool savePreset(Plugin* p, int index) {  // audio thread (the page's SAVE)
+    p->updateDisplay.store(true, std::memory_order_relaxed);  // the status, and the selector loses "(empty)"
     if (index < kFactory) {
-        setStatus(p, "%s", "Pick a User slot to save");
+        p->status.store(statusCode(kStPickUser, 0), std::memory_order_relaxed);
         return false;
     }
-    char name[32], path[700], tmp[720], text[sizeof p->chunk];
-    programName(index, name, sizeof name);
-    const size_t len = serialize(p, text, sizeof text, false);
-    ::mkdir(p->presetDir, 0755);
-    userPath(p, index - kFactory, path, sizeof path);
-    std::snprintf(tmp, sizeof tmp, "%s.new", path);
-    FILE* f = std::fopen(tmp, "wb");
-    bool ok = f && len > 0 && std::fwrite(text, 1, len, f) == len;
-    if (f) ok = (std::fclose(f) == 0) && ok;
-    ok = ok && std::rename(tmp, path) == 0;
-    if (!ok) {
-        std::remove(tmp);
-        setStatus(p, "Could not save %s", name);
+    float values[kNumSound];
+    for (int i = 0; i < kNumSound; ++i) values[i] = p->norm[i].load(std::memory_order_relaxed);
+    if (!bankWrite(index - kFactory, values)) {
+        p->status.store(statusCode(kStBusy, index), std::memory_order_relaxed);
         return false;
     }
-    p->userSaved.fetch_or(1u << (index - kFactory), std::memory_order_relaxed);
     p->program.store(index, std::memory_order_relaxed);
-    p->dirty[kPresetIdx].store(1, std::memory_order_relaxed);
-    setStatus(p, "Saved %s", name);
+    p->status.store(statusCode(kStSaved, index), std::memory_order_relaxed);
     return true;
 }
 
@@ -499,50 +587,56 @@ void pressButton(Plugin* p, int i) {
             p->updateDisplay.store(true, std::memory_order_relaxed);
             break;
         }
-        case kLoadIdx: loadPreset(p, p->cursor.load(std::memory_order_relaxed)); break;
+        case kLoadIdx: loadPreset(p, p->cursor.load(std::memory_order_relaxed), true); break;
         case kSaveIdx: savePreset(p, p->cursor.load(std::memory_order_relaxed)); break;
         default: break;
     }
 }
 
 // ---- Audio --------------------------------------------------------------------------------------------------
-void syncParams(Plugin* p) {
-    for (int i = 0; i < kNumSound; ++i) p->core.setParam(i, p->norm[i].load(std::memory_order_relaxed));
+// Parameter 0 (Input) only takes an end value (0 or 1) once it has stayed there for a block: MPC sets parameter 0
+// to 1.0 or 0.0 and straight back whenever it prepares the plugin (older OS versions also on STOP), which would
+// otherwise be heard as a +40 dB burst or a dropout. settle: take it at once (loads, resume).
+void syncParams(Plugin* p, bool settle) {
+    for (int i = 1; i < kNumSound; ++i) p->core.setParam(i, p->norm[i].load(std::memory_order_relaxed));
+    const float in = p->norm[0].load(std::memory_order_relaxed);
+    const bool end = in <= 0.f || in >= 1.f;
+    if (!end || settle || in == p->edgeSeen) p->core.setParam(0, in);
+    p->edgeSeen = end ? in : -1.f;
 }
 
 float getParameter(AEffect* e, int32_t i);
 
 // Tell the host what changed on our side: buttons going back to 0, knobs moved by a preset. Called from
 // processReplacing, never from inside a host call (the host may call setParameter back from in here). At most
-// kMaxNotify parameter changes per block, so a preset load doesn't hit the host with 30 calls in one block; the
-// display refresh goes out once the last of them has.
+// kMaxNotify parameter changes per block, so a preset load doesn't hit the host with 30 calls in one block. A
+// display update (the host re-reads every name and text and rebuilds the page, closing its PRESET menu) only goes
+// out when a text changed that the host can't see from a value: the status line, a slot's "(empty)", Freq 2's
+// "Locked". It waits until the parameter changes have all gone out.
 void notifyHost(Plugin* p, int32_t frames) {
     if (!p->master) return;
-    bool any = false;
     for (int i = 0; i < kNumVst; ++i) {
         if (p->holdFrames[i].load(std::memory_order_relaxed) > 0 &&
             p->holdFrames[i].fetch_sub(frames, std::memory_order_relaxed) <= frames) {
             p->holdFrames[i].store(0, std::memory_order_relaxed);
             p->pressed[i].store(0.f, std::memory_order_relaxed);
             p->master(&p->fx, audioMasterAutomate, i, 0, nullptr, 0.f);
-            any = true;
         }
     }
     int sent = 0;
-    bool more = false;
     for (int i = 0; i < kNumVst; ++i) {
         if (!p->dirty[i].load(std::memory_order_relaxed)) continue;
-        if (sent == kMaxNotify) {
-            more = true;
-            break;
-        }
+        if (sent == kMaxNotify) return;  // the rest, and any display update, next block
         if (!p->dirty[i].exchange(0, std::memory_order_relaxed)) continue;  // atomic: a flag set meanwhile survives
         p->master(&p->fx, audioMasterAutomate, i, 0, nullptr, getParameter(&p->fx, i));
         ++sent;
-        any = true;
     }
-    if (more) return;  // the display refresh waits for the rest
-    if (p->updateDisplay.exchange(false, std::memory_order_relaxed) || any)
+    const bool lock = harmonicLock(p->norm[sk::kHarmonics].load(std::memory_order_relaxed));
+    if (lock != p->shownLock.load(std::memory_order_relaxed)) {
+        p->shownLock.store(lock, std::memory_order_relaxed);
+        p->updateDisplay.store(true, std::memory_order_relaxed);
+    }
+    if (p->updateDisplay.exchange(false, std::memory_order_relaxed))
         p->master(&p->fx, audioMasterUpdateDisplay, 0, 0, nullptr, 0.f);
 }
 
@@ -560,6 +654,12 @@ void run(AEffect* e, float** in, float** out, int32_t n, bool accumulate) {
     if (!out || !out[0] || n <= 0) return;
     {
         sk::ScopedFlushDenormals ftz;
+        if (p->resetRequest.exchange(false, std::memory_order_acquire)) {  // resumed: from silence, no glides
+            syncParams(p, true);
+            p->core.reset();
+            p->fadeLeft = 0;
+            p->presetLoaded.store(false, std::memory_order_relaxed);
+        }
         // Acquire first: a chunk or preset stores all its values before raising its flag.
         const bool snap = p->snap.exchange(false, std::memory_order_acquire);
         // A preset load crossfades: the old sound carries on from exactly where it is in `fading`, the current
@@ -570,7 +670,7 @@ void run(AEffect* e, float** in, float** out, int32_t n, bool accumulate) {
             p->fading = p->core;
             p->fadeLeft = p->fadeLength;
         }
-        syncParams(p);
+        syncParams(p, snap || preset);
         if (snap) {
             p->fadeLeft = 0;  // a project load replaces everything at once
             p->presetLoaded.store(false, std::memory_order_relaxed);
@@ -599,14 +699,12 @@ void run(AEffect* e, float** in, float** out, int32_t n, bool accumulate) {
                     r[i] = fr[i] + g * (r[i] - fr[i]);
                 }
             }
-            for (int32_t i = 0; i < len; ++i) {
-                if (accumulate) {
-                    out[0][off + i] += l[i];
-                    if (outR) outR[off + i] += r[i];
-                } else {
-                    out[0][off + i] = l[i];
-                    if (outR) outR[off + i] = r[i];
-                }
+            if (accumulate) {
+                for (int32_t i = 0; i < len; ++i) out[0][off + i] += l[i];
+                if (outR) for (int32_t i = 0; i < len; ++i) outR[off + i] += r[i];
+            } else {
+                std::memcpy(out[0] + off, l, sizeof(float) * static_cast<size_t>(len));
+                if (outR) std::memcpy(outR + off, r, sizeof(float) * static_cast<size_t>(len));
             }
             off += len;
         }
@@ -617,16 +715,20 @@ void run(AEffect* e, float** in, float** out, int32_t n, bool accumulate) {
 void processReplacing(AEffect* e, float** in, float** out, int32_t n) { run(e, in, out, n, false); }
 void processAccumulating(AEffect* e, float** in, float** out, int32_t n) { run(e, in, out, n, true); }
 
-// A value on an option selects it (a button on the page, a preset, automation); a value between options is a
-// Q-Link or data-wheel nudge from the current one (MPC sends the read-back value plus 1/128), so step one option
-// that way -- otherwise small nudges round back and never switch.
+// Option parameters (the switches, the preset selector). A value on an option selects it: a button on the page, a
+// preset, automation. Anything else is a Q-Link or data-wheel move. MPC sends the value it read back plus or minus
+// a small step, so within one option of the current one, step one option that way (rounding would snap a small
+// nudge back and never switch); further away it is a jump (a fast sweep, an absolute controller): take the nearest.
 float settleOption(float n, float current, int count) {
-    const float pos = n * (count - 1);
-    if (std::fabs(pos - std::round(pos)) <= 0.001f) return std::round(pos) / (count - 1);
-    const float cur = std::round(current * (count - 1));
+    const float last = static_cast<float>(count - 1);
+    const float pos = n * last;
+    const float nearest = std::round(pos);
+    if (std::fabs(pos - nearest) <= 0.001f) return nearest / last;
+    const float cur = std::round(current * last);
+    if (std::fabs(pos - cur) >= 1.f) return nearest / last;
     float idx = cur + (pos > cur ? 1.f : -1.f);
-    idx = idx < 0.f ? 0.f : idx > count - 1 ? static_cast<float>(count - 1) : idx;
-    return idx / (count - 1);
+    idx = idx < 0.f ? 0.f : idx > last ? last : idx;
+    return idx / last;
 }
 
 void setParameter(AEffect* e, int32_t i, float v) {
@@ -649,11 +751,10 @@ void setParameter(AEffect* e, int32_t i, float v) {
                 p->pressed[i].store(0.f, std::memory_order_relaxed);  // the host echoing our own release
             }
             break;
-        case kSelector: {
+        case kSelector: {  // the host re-reads the text of a value it changed: no display update needed
             const float cur = static_cast<float>(p->cursor.load(std::memory_order_relaxed)) / (kPrograms - 1);
             p->cursor.store(static_cast<int>(std::lround(settleOption(n, cur, kPrograms) * (kPrograms - 1))),
                             std::memory_order_relaxed);
-            p->updateDisplay.store(true, std::memory_order_relaxed);
             break;
         }
         case kReadout: break;
@@ -672,24 +773,56 @@ float getParameter(AEffect* e, int32_t i) {
     return 0.f;
 }
 
+void statusText(const Plugin* p, char* out, size_t len) {
+    const uint32_t code = p->status.load(std::memory_order_relaxed);
+    char name[32];
+    programName(static_cast<int>(code & 0xffu) % kPrograms, name, sizeof name);
+    switch (static_cast<StatusKind>(code >> 8)) {
+        case kStProgram: std::snprintf(out, len, "%s", name); break;
+        case kStLoaded: std::snprintf(out, len, "Loaded %s", name); break;
+        case kStEmpty: std::snprintf(out, len, "%s is empty", name); break;
+        case kStSaved: std::snprintf(out, len, "Saved %s", name); break;
+        case kStPickUser: std::snprintf(out, len, "Pick a User slot to save"); break;
+        case kStBusy: std::snprintf(out, len, "Busy, press again"); break;
+        case kStWriteFailed: std::snprintf(out, len, "Could not write %s to disk", name); break;
+        default: out[0] = 0; break;
+    }
+}
+
 void displayText(Plugin* p, int i, char* out, size_t len) {
     out[0] = 0;
     if (kParams[i].kind == kSound) {
-        const bool lock = sk::map::option(p->norm[sk::kHarmonics].load(std::memory_order_relaxed), 12) > 0;
+        const bool lock = harmonicLock(p->norm[sk::kHarmonics].load(std::memory_order_relaxed));
         formatSound(i, p->norm[i].load(std::memory_order_relaxed), lock, out, len);
     } else if (i == kPresetIdx) {
         const int c = p->cursor.load(std::memory_order_relaxed);
         char name[32];
         programName(c, name, sizeof name);
-        const bool empty = c >= kFactory && !(p->userSaved.load(std::memory_order_relaxed) & (1u << (c - kFactory)));
+        const bool empty = c >= kFactory && !(gBank.saved.load(std::memory_order_relaxed) & (1u << (c - kFactory)));
         std::snprintf(out, len, empty ? "%s (empty)" : "%s", name);
     } else if (i == kStatusIdx) {
-        std::snprintf(out, len, "%s", p->status);
+        statusText(p, out, len);
     }
+}
+
+void prepareCores(Plugin* p, float fs) {
+    p->sampleRate = fs;
+    p->core.prepare(fs);
+    p->fading.prepare(fs);
+    p->fadeLength = static_cast<int>(kFadeSeconds * fs) > 0 ? static_cast<int>(kFadeSeconds * fs) : 1;
+    p->fadeStep = 1.f / static_cast<float>(p->fadeLength);
+    p->fadeLeft = 0;
 }
 
 intptr_t dispatcher(AEffect* e, int32_t op, int32_t idx, intptr_t v, void* ptr, float opt) {
     Plugin* p = self(e);
+    switch (op) {  // UI-thread calls that follow a SAVE: write the saved slots to disk here, never in process
+        case effClose: case effGetParamName: case effGetParamDisplay: case effGetProgramNameIndexed:
+        case effGetChunk: case effMainsChanged:
+            flushBank(p);
+            break;
+        default: break;
+    }
     switch (op) {
         case effOpen: return 1;
         case effClose:
@@ -720,7 +853,8 @@ intptr_t dispatcher(AEffect* e, int32_t op, int32_t idx, intptr_t v, void* ptr, 
         // is already current does nothing, so a host re-selecting it after loading a project can't overwrite the
         // sound the project restored.
         case effSetProgram:
-            if (v >= 0 && v < kPrograms && v != p->program.load(std::memory_order_relaxed)) loadPreset(p, static_cast<int>(v));
+            if (v >= 0 && v < kPrograms && v != p->program.load(std::memory_order_relaxed))
+                loadPreset(p, static_cast<int>(v), false);
             return 0;
         case effGetProgram: return p->program.load(std::memory_order_relaxed);
         case effSetProgramName: return 0;
@@ -737,27 +871,18 @@ intptr_t dispatcher(AEffect* e, int32_t op, int32_t idx, intptr_t v, void* ptr, 
             copyStr(ptr, name, 24);
             return 1;
         }
-        case effSetSampleRate: {
-            const float fs = opt > 0.f ? opt : 44100.f;
-            p->core.prepare(fs);
-            p->fading.prepare(fs);
-            p->fadeLength = static_cast<int>(kFadeSeconds * fs) > 0 ? static_cast<int>(kFadeSeconds * fs) : 1;
-            p->fadeStep = 1.f / static_cast<float>(p->fadeLength);
-            p->fadeLeft = 0;
+        case effSetSampleRate:  // MPC sends 44.1 kHz, several times while loading: only a real change prepares
+            if (opt > 0.f && opt != p->sampleRate) prepareCores(p, opt);
             return 1;
-        }
-        case effSetBlockSize: return 1;
+        case effSetBlockSize: return 1;  // any block size works, up to whatever the host sends
         case effMainsChanged:
-            if (v) {  // resume: start from silence with the current settings
-                syncParams(p);
-                p->core.reset();
-                p->fadeLeft = 0;
-                p->presetLoaded.store(false, std::memory_order_relaxed);
-            }
+            if (v) p->resetRequest.store(true, std::memory_order_release);  // the audio thread resets
             return 1;
         case effGetChunk: {
             if (!ptr) return 0;
-            const size_t len = serialize(p, p->chunk, sizeof p->chunk, true);
+            float values[kNumSound];
+            for (int i = 0; i < kNumSound; ++i) values[i] = p->norm[i].load(std::memory_order_relaxed);
+            const size_t len = serialize(values, p->program.load(std::memory_order_relaxed), p->chunk, sizeof p->chunk);
             if (!len) return 0;
             *static_cast<void**>(ptr) = p->chunk;
             return static_cast<intptr_t>(len + 1);
@@ -769,6 +894,8 @@ intptr_t dispatcher(AEffect* e, int32_t op, int32_t idx, intptr_t v, void* ptr, 
             for (int i = 0; i < kNumSound; ++i) p->norm[i].store(values[i], std::memory_order_relaxed);
             p->program.store(program, std::memory_order_relaxed);
             p->cursor.store(program, std::memory_order_relaxed);
+            p->status.store(statusCode(kStProgram, program), std::memory_order_relaxed);
+            p->shownLock.store(harmonicLock(values[sk::kHarmonics]), std::memory_order_relaxed);
             p->snap.store(true, std::memory_order_release);  // after the values: the audio thread sees them all
             return 1;
         }
@@ -783,17 +910,11 @@ intptr_t dispatcher(AEffect* e, int32_t op, int32_t idx, intptr_t v, void* ptr, 
 extern "C" __attribute__((visibility("default"))) void* VSTPluginMain(void* hostCallback) {
     void* mem = std::calloc(1, sizeof(Plugin));
     if (!mem) return nullptr;
+    readBank();  // the user slots, from disk: once per process
     Plugin* p = new (mem) Plugin;
     p->master = reinterpret_cast<audioMasterCallback>(hostCallback);
-    p->core.prepare(44100.0);  // MPC OS runs at 44.1 kHz; effSetSampleRate overrides it
-    p->fading.prepare(44100.0);
-    const char* override = std::getenv("SKFB_PRESET_DIR");
-    char dir[512];
-    if (override && *override) std::snprintf(p->presetDir, sizeof p->presetDir, "%s", override);
-    else if (pluginDir(dir, sizeof dir)) std::snprintf(p->presetDir, sizeof p->presetDir, "%s/presets", dir);
-    else std::snprintf(p->presetDir, sizeof p->presetDir, "/tmp/sk_filterbank_presets");
-    scanUserSlots(p);
-    std::snprintf(p->status, sizeof p->status, "Init");
+    // The cores are constructed prepared for 44.1 kHz, MPC OS's rate (fadeLength and sampleRate match it); a
+    // different effSetSampleRate prepares them again.
     AEffect& e = p->fx;
     e.magic = kVstMagic;
     e.dispatcher = dispatcher;
