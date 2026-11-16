@@ -27,6 +27,7 @@
 #include <new>
 
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 extern "C" __attribute__((visibility("default"))) void* VSTPluginMain(void* master);
@@ -280,6 +281,7 @@ void formatSound(int id, float n, bool harmonicLock, char* out, size_t len) {
 // from the UI thread, and so does every dispatcher call. Nothing here locks, allocates or does file I/O on the
 // audio thread; files are only touched in dispatcher calls.
 constexpr int kHoldFrames = 5292;  // a pressed button stays lit for ~120 ms, then the host hears it go back to 0
+constexpr uint32_t kDebounceFrames = 11025, kDebounceMs = 250;  // a second press this soon is the same tap
 constexpr int kMaxNotify = 8;      // parameter changes reported to the host per block (a preset load spreads out)
 constexpr float kFadeSeconds = 0.03f;
 constexpr int kScratch = 256;      // frames processed per core call
@@ -292,6 +294,12 @@ constexpr uint32_t statusCode(StatusKind kind, int program) { return kind << 8 |
 
 bool harmonicLock(float harmonics) { return sk::map::option(harmonics, 12) > 0; }
 
+uint32_t nowMs() {  // monotonic milliseconds, wrapping (clock_gettime is a vDSO call: fine on the audio thread)
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint32_t>(ts.tv_sec) * 1000u + static_cast<uint32_t>(ts.tv_nsec / 1000000);
+}
+
 struct Plugin {
     AEffect fx;
     audioMasterCallback master = nullptr;
@@ -301,9 +309,12 @@ struct Plugin {
     float fadeStep = 1.f / 1323.f;            // 1 / fadeLength
     float edgeSeen = -1.f;                    // parameter 0's end value (0 or 1) seen last block (audio thread)
     float sampleRate = 44100.f;
+    std::atomic<uint32_t> frames{0};          // frames processed so far (wraps)
     std::atomic<float> norm[kNumSound];       // the sound
+    std::atomic<float> sent[kNumVst];         // the value the host last set (-1: none yet)
     std::atomic<float> pressed[kNumVst];      // momentary buttons: 1 while lit
     std::atomic<int> holdFrames[kNumVst];     // frames until a lit button is reported back to 0
+    std::atomic<uint32_t> pressFrame[kNumVst], pressMs[kNumVst];  // when a button press was last acted on
     std::atomic<uint8_t> dirty[kNumVst];      // the host must hear this parameter's new value (preset loads)
     std::atomic<bool> snap{false};            // a chunk was loaded: jump to it instead of gliding
     std::atomic<bool> presetLoaded{false};    // a preset was loaded: crossfade to it
@@ -319,10 +330,14 @@ struct Plugin {
 
     Plugin() {
         for (int i = 0; i < kNumSound; ++i) norm[i].store(sk::kDefaults[i], std::memory_order_relaxed);
+        const uint32_t now = nowMs();
         for (int i = 0; i < kNumVst; ++i) {
+            sent[i].store(-1.f, std::memory_order_relaxed);
             pressed[i].store(0.f, std::memory_order_relaxed);
             holdFrames[i].store(0, std::memory_order_relaxed);
             dirty[i].store(0, std::memory_order_relaxed);
+            pressFrame[i].store(0u - 2 * kDebounceFrames, std::memory_order_relaxed);  // long ago
+            pressMs[i].store(now - 2 * kDebounceMs, std::memory_order_relaxed);
         }
         shownLock.store(harmonicLock(sk::kDefaults[sk::kHarmonics]), std::memory_order_relaxed);
     }
@@ -439,21 +454,16 @@ bool pluginDir(char* out, size_t n) {
     return ok;
 }
 
-void userPath(int slot, char* out, size_t n) { std::snprintf(out, n, "%s/user_%02d.skfb", gBank.dir, slot + 1); }
+void slotPath(const char* dir, int slot, char* out, size_t n) { std::snprintf(out, n, "%s/user_%02d.skfb", dir, slot + 1); }
+void userPath(int slot, char* out, size_t n) { slotPath(gBank.dir, slot, out, n); }
 
-// Reads the user slots from disk, once per process (the first instance; host UI thread).
-void readBank() {
-    int expected = 0;
-    if (!gBank.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) return;
-    const char* override = std::getenv("SKFB_PRESET_DIR");
-    char dir[512];
-    if (override && *override) std::snprintf(gBank.dir, sizeof gBank.dir, "%s", override);
-    else if (pluginDir(dir, sizeof dir)) std::snprintf(gBank.dir, sizeof gBank.dir, "%s/presets", dir);
-    else std::snprintf(gBank.dir, sizeof gBank.dir, "/tmp/sk_filterbank_presets");
+// Reads the preset files in dir into the slots that don't hold one yet; returns the slots it filled.
+uint32_t readSlots(const char* dir, uint32_t have) {
     uint32_t mask = 0;
     for (int s = 0; s < kUserSlots; ++s) {
+        if (have & (1u << s)) continue;
         char path[700], text[kTextCap];
-        userPath(s, path, sizeof path);
+        slotPath(dir, s, path, sizeof path);
         FILE* f = std::fopen(path, "rb");
         if (!f) continue;
         const size_t got = std::fread(text, 1, sizeof text - 1, f);
@@ -462,6 +472,37 @@ void readBank() {
         if (!deserialize(text, got, values, nullptr)) continue;
         for (int k = 0; k < kNumSound; ++k) gBank.values[s][k].store(values[k], std::memory_order_relaxed);
         mask |= 1u << s;
+    }
+    return mask;
+}
+
+// Where the legacy installer (MPC OS 3.10.0 and older) puts the plugin folder by default.
+constexpr const char* kLegacyPresets = "/sdcard/Synths/Sher Khan - VST - SK Filterbank/presets";
+
+// Reads the user slots from disk, once per process (the first instance; host UI thread). The presets live in
+// presets/ inside the plugin folder: next to the .so (legacy layout) or one up from VST/ (Akai's SDK layout). A
+// folder with no presets yet (a fresh VST2 Plugins install) starts from the legacy install's, which are written
+// into it at the next save point, so moving to MPC OS 3.10.1's plugin folders keeps them.
+void readBank() {
+    int expected = 0;
+    if (!gBank.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) return;
+    const char* override = std::getenv("SKFB_PRESET_DIR");
+    char dir[512];
+    if (override && *override) {
+        std::snprintf(gBank.dir, sizeof gBank.dir, "%s", override);
+    } else if (pluginDir(dir, sizeof dir)) {
+        char* slash = std::strrchr(dir, '/');
+        if (slash && slash != dir && !std::strcmp(slash + 1, "VST")) *slash = 0;
+        std::snprintf(gBank.dir, sizeof gBank.dir, "%s/presets", dir);
+    } else {
+        std::snprintf(gBank.dir, sizeof gBank.dir, "/tmp/sk_filterbank_presets");
+    }
+    uint32_t mask = readSlots(gBank.dir, 0);
+    const char* legacy = std::getenv("SKFB_LEGACY_DIR");  // tests
+    if (!legacy) legacy = kLegacyPresets;
+    if (!mask && *legacy && std::strcmp(legacy, gBank.dir) != 0) {
+        mask = readSlots(legacy, 0);
+        gBank.unwritten.store(mask, std::memory_order_relaxed);
     }
     gBank.saved.store(mask, std::memory_order_release);
     gBank.state.store(2, std::memory_order_release);
@@ -680,6 +721,7 @@ void run(AEffect* e, float** in, float** out, int32_t n, bool accumulate) {
             p->core.trigger();
             if (p->fadeLeft > 0) p->fading.trigger();
         }
+        p->frames.store(p->frames.load(std::memory_order_relaxed) + static_cast<uint32_t>(n), std::memory_order_relaxed);
         float* outR = out[1];
         float* l = p->scratch[0];
         float* r = p->scratch[1];
@@ -715,19 +757,35 @@ void run(AEffect* e, float** in, float** out, int32_t n, bool accumulate) {
 void processReplacing(AEffect* e, float** in, float** out, int32_t n) { run(e, in, out, n, false); }
 void processAccumulating(AEffect* e, float** in, float** out, int32_t n) { run(e, in, out, n, true); }
 
+// A Q-Link or data-wheel tick moves the host's value by 1/128 of the range (measured on MPC One+ and Live III),
+// from the value it read back from us or, about a third of the time, from the value it sent last. Returns the
+// tick's direction from base (+1, -1), or 0 if n isn't a few ticks away from it.
+int tickFrom(float n, float base) {
+    if (base < 0.f) return 0;
+    const float d = (n - base) * 128.f;
+    const float k = std::round(d);
+    if (k == 0.f || std::fabs(k) > 4.f || std::fabs(d - k) > 0.004f) return 0;
+    return k > 0.f ? 1 : -1;
+}
+
 // Option parameters (the switches, the preset selector). A value on an option selects it: a button on the page, a
-// preset, automation. Anything else is a Q-Link or data-wheel move. MPC sends the value it read back plus or minus
-// a small step, so within one option of the current one, step one option that way (rounding would snap a small
-// nudge back and never switch); further away it is a jump (a fast sweep, an absolute controller): take the nearest.
-float settleOption(float n, float current, int count) {
+// preset, automation. A tick steps one option its way, judged from whichever value the host started from (judging
+// it only from our current option turned some turns the wrong way). Anything else between options: within one
+// option of the current one, a nudge of another size, so one option that way (rounding would snap it back);
+// further away a jump (a fast sweep, an absolute controller), so the nearest.
+float settleOption(float n, float current, float lastSent, int count) {
     const float last = static_cast<float>(count - 1);
     const float pos = n * last;
     const float nearest = std::round(pos);
     if (std::fabs(pos - nearest) <= 0.001f) return nearest / last;
     const float cur = std::round(current * last);
-    if (std::fabs(pos - cur) >= 1.f) return nearest / last;
-    float idx = cur + (pos > cur ? 1.f : -1.f);
-    idx = idx < 0.f ? 0.f : idx > last ? last : idx;
+    int step = tickFrom(n, current);
+    if (!step) step = tickFrom(n, lastSent);
+    if (!step) {
+        if (std::fabs(pos - cur) >= 1.f) return nearest / last;
+        step = pos > cur ? 1 : -1;
+    }
+    const float idx = sk::clampf(cur + static_cast<float>(step), 0.f, last);
     return idx / last;
 }
 
@@ -735,25 +793,37 @@ void setParameter(AEffect* e, int32_t i, float v) {
     if (i < 0 || i >= kNumVst) return;
     Plugin* p = self(e);
     const float n = v >= 0.f ? (v <= 1.f ? v : 1.f) : 0.f;  // also maps NaN to 0
+    const float lastSent = p->sent[i].exchange(n, std::memory_order_relaxed);
     switch (kParams[i].kind) {
         case kSound: {
             const int count = sk::kOptionCount[i];
-            const float val = count ? settleOption(n, p->norm[i].load(std::memory_order_relaxed), count) : n;
+            const float val = count ? settleOption(n, p->norm[i].load(std::memory_order_relaxed), lastSent, count) : n;
             p->norm[i].store(val, std::memory_order_relaxed);
             break;
         }
         case kMomentary:
             if (n > 0.5f && p->pressed[i].load(std::memory_order_relaxed) < 0.5f) {
+                // One tap can reach us as two presses 30-140 ms apart with no release between (finger down and up;
+                // measured on a Live III). A press within 250 ms of the last one acted on is that second half: it
+                // lights and springs back like any press (so the host's button doesn't stay on) but does nothing.
+                // Audio frames count too, so a test running faster than real time isn't held back.
+                const uint32_t ms = nowMs(), fr = p->frames.load(std::memory_order_relaxed);
+                const bool repeat = fr - p->pressFrame[i].load(std::memory_order_relaxed) < kDebounceFrames &&
+                                    ms - p->pressMs[i].load(std::memory_order_relaxed) < kDebounceMs;
                 p->pressed[i].store(1.f, std::memory_order_relaxed);
                 p->holdFrames[i].store(kHoldFrames, std::memory_order_relaxed);
-                pressButton(p, i);
+                if (!repeat) {
+                    p->pressFrame[i].store(fr, std::memory_order_relaxed);
+                    p->pressMs[i].store(ms, std::memory_order_relaxed);
+                    pressButton(p, i);
+                }
             } else if (n <= 0.5f) {
                 p->pressed[i].store(0.f, std::memory_order_relaxed);  // the host echoing our own release
             }
             break;
         case kSelector: {  // the host re-reads the text of a value it changed: no display update needed
             const float cur = static_cast<float>(p->cursor.load(std::memory_order_relaxed)) / (kPrograms - 1);
-            p->cursor.store(static_cast<int>(std::lround(settleOption(n, cur, kPrograms) * (kPrograms - 1))),
+            p->cursor.store(static_cast<int>(std::lround(settleOption(n, cur, lastSent, kPrograms) * (kPrograms - 1))),
                             std::memory_order_relaxed);
             break;
         }

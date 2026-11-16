@@ -98,7 +98,7 @@ void idle(AEffect* a, int blocks) {  // silent blocks: lets buttons spring back 
 
 void press(AEffect* a, int button) {
     a->setParameter(a, button, 1.f);
-    idle(a, 60);  // ~170 ms: the button lights, then goes back to 0
+    idle(a, 90);  // ~260 ms: the button lights, goes back to 0, and the next press counts as a new tap
 }
 
 std::vector<float> sine(double hz, float amp, size_t n) {
@@ -293,6 +293,50 @@ int main(int argc, char** argv) {
               display(a, sk::kFreq2) == "Locked",
               "display updates: TRIG %d, selector %d, lock %d, ratio %d, unlock %d, menu program %d",
               afterTrig, afterSelector, afterLock, afterRatio, afterUnlock, gUpdates);
+    }
+    {   // MPC can deliver one tap as two presses 30-140 ms apart with no release between: NEXT steps once, and the
+        // button still springs back so the host's toggle doesn't stay on.
+        a->setParameter(a, kPreset, 0.f);
+        idle(a, 90);
+        a->setParameter(a, kNext, 1.f);
+        idle(a, 10);   // 29 ms: still lit
+        a->setParameter(a, kNext, 1.f);
+        idle(a, 37);   // 136 ms: it sprang back at 120 ms, and here is the same tap again
+        a->setParameter(a, kNext, 1.f);
+        idle(a, 90);
+        const std::string once = display(a, kPreset);
+        a->setParameter(a, kNext, 1.f);  // a real second tap, 400 ms after the first
+        idle(a, 90);
+        CHECK(once == "Acid Squelch" && display(a, kPreset) == "Funk Follower" && a->getParameter(a, kNext) == 0.f,
+              "one tap delivered twice steps once (\"%s\"), the next tap steps again (\"%s\")", once.c_str(),
+              display(a, kPreset).c_str());
+    }
+    {   // Q-Link and data-wheel turns: each tick moves the host's value 1/128 from what it read back or, about a
+        // third of the time, from what it sent last. Every tick must step one option the way it turns.
+        uint32_t x = 77;
+        auto rnd = [&x] { x = x * 1664525u + 1013904223u; return (x >> 8) * (1.f / 16777216.f); };
+        int wrong = 0, ticks = 0;
+        for (int param : {static_cast<int>(sk::kHarmonics), static_cast<int>(sk::kEnvMode), kPreset}) {
+            const int count = param == kPreset ? kPrograms : sk::kOptionCount[param];
+            a->setParameter(a, param, 0.f);
+            float own = 0.f;  // the host's own idea of the value
+            for (int dir : {1, -1}) {
+                for (int t = 0; t < count + 3; ++t) {
+                    const float before = a->getParameter(a, param);
+                    const float base = rnd() < 0.3f ? own : before;
+                    own = std::min(1.f, std::max(0.f, base + dir / 128.f));
+                    a->setParameter(a, param, own);
+                    const int was = static_cast<int>(std::lround(before * (count - 1)));
+                    const int now = static_cast<int>(std::lround(a->getParameter(a, param) * (count - 1)));
+                    const int want = std::min(count - 1, std::max(0, was + dir));
+                    wrong += now != want;
+                    ++ticks;
+                }
+            }
+        }
+        a->setParameter(a, sk::kHarmonics, 0.f);
+        a->setParameter(a, sk::kEnvMode, 0.f);
+        CHECK(wrong == 0, "Q-Link turns over switches and the selector: %d of %d ticks went wrong", wrong, ticks);
     }
 
     {   // TRIG: a quiet tone stays under the trigger level; the button fires the envelope and opens filter 1.
@@ -614,20 +658,31 @@ int main(int argc, char** argv) {
         };
         char t1[] = "/tmp/skfb_copy1_XXXXXX", t2[] = "/tmp/skfb_copy2_XXXXXX";
         const std::string d1 = mkdtemp(t1), d2 = mkdtemp(t2);
-        const std::string so1 = d1 + "/sk_filterbank.so", so2 = d2 + "/sk_filterbank.so";
+        ::mkdir((d2 + "/VST").c_str(), 0755);  // Akai's SDK layout: <plugin folder>/VST/<name>-arm32.so
+        const std::string so1 = d1 + "/sk_filterbank.so", so2 = d2 + "/VST/sk-filterbank-arm32.so";
         CHECK(copyFile(argv[1], so1) && copyFile(argv[1], so2), "copies of the .so for fresh processes");
+        // Also the move from the legacy install: this copy's own preset folder is empty, so it starts from the
+        // legacy folder's presets (here: the ones saved above) and writes them into its own.
+        const std::string fresh = d1 + "/presets";
+        setenv("SKFB_PRESET_DIR", fresh.c_str(), 1);
+        setenv("SKFB_LEGACY_DIR", presetDir, 1);
         void* lib1 = dlopen(so1.c_str(), RTLD_NOW | RTLD_LOCAL);
         auto entry1 = lib1 ? reinterpret_cast<MainFn>(dlsym(lib1, "VSTPluginMain")) : nullptr;
         AEffect* c = entry1 ? entry1(host) : nullptr;
+        unsetenv("SKFB_LEGACY_DIR");
+        setenv("SKFB_PRESET_DIR", presetDir, 1);
         if (c) {
             c->setParameter(c, kPreset, float(kFactory) / (kPrograms - 1));
             c->dispatcher(c, 2, 0, kFactory, nullptr, 0);
-            CHECK(display(c, kPreset) == "User 01" && std::fabs(c->getParameter(c, sk::kFreq1) - 0.3f) < 2e-6f,
-                  "a fresh process reads User 01 back from disk (\"%s\")", display(c, kPreset).c_str());
+            CHECK(display(c, kPreset) == "User 01" && std::fabs(c->getParameter(c, sk::kFreq1) - 0.3f) < 2e-6f &&
+                  fileExists(fresh + "/user_01.skfb"),
+                  "a fresh install finds the legacy install's User 01 (\"%s\") and keeps a copy", display(c, kPreset).c_str());
             c->dispatcher(c, 1, 0, 0, nullptr, 0);
         } else {
             CHECK(false, "load the copy: %s", dlerror());
         }
+        std::remove((fresh + "/user_01.skfb").c_str());
+        ::rmdir(fresh.c_str());
         // On the device there is no override: presets go to presets/ next to the .so, found via /proc/self/maps.
         unsetenv("SKFB_PRESET_DIR");
         void* lib2 = dlopen(so2.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -639,7 +694,8 @@ int main(int argc, char** argv) {
             press(e2, kSave);
             const bool before = fileExists(file);
             display(e2, kStatus);
-            CHECK(!before && fileExists(file), "without an override, SAVE writes %s (on the UI thread)", file.c_str());
+            CHECK(!before && fileExists(file), "without an override, SAVE writes %s (the plugin folder, on the UI thread)",
+              file.c_str());
             e2->dispatcher(e2, 1, 0, 0, nullptr, 0);
         } else {
             CHECK(false, "load the second copy: %s", dlerror());
@@ -648,6 +704,7 @@ int main(int argc, char** argv) {
         ::rmdir((d2 + "/presets").c_str());
         std::remove(so1.c_str());
         std::remove(so2.c_str());
+        ::rmdir((d2 + "/VST").c_str());
         ::rmdir(d1.c_str());
         ::rmdir(d2.c_str());
     }

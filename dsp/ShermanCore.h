@@ -52,18 +52,27 @@
 #define SK_INLINE inline
 #endif
 
-// NEON (the Force's RK3288 has it): the same processing two channels or four steps at a time. The rest of the
-// plugin is built for plain VFP like the community's MPC plugins, so the NEON code is compiled for NEON only and
-// picked at load time (getauxval), falling back to the plain path on a CPU without it. SK_NO_NEON=1 in the
-// environment forces the plain path (tests compare the two).
-#if defined(__arm__) && defined(__linux__) && defined(__GNUC__) && !defined(__clang__)
+// NEON: the same processing two channels or four steps at a time. Every MPC has it: the Gen1 products' RK3288
+// (armv7, built with -mfpu=neon-vfpv4 like Akai's SDK) and the arm64 ones (Advanced SIMD is part of armv8). An
+// armv7 build without NEON in its flags still compiles the NEON code, for NEON only, and picks it at load time
+// (getauxval). SK_NO_NEON=1 in the environment forces the plain path (tests compare the two).
+#if defined(__linux__) && defined(__GNUC__) && !defined(__clang__) && (defined(__aarch64__) || defined(__arm__))
 #define SK_NEON 1
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#define SK_NEON_FN inline __attribute__((always_inline))
+#define SK_NEON_BLOCK __attribute__((noinline))
+#define SK_NEON_ALWAYS 1
+#else
 #pragma GCC push_options
 #pragma GCC target("fpu=neon")
 #include <arm_neon.h>
 #pragma GCC pop_options
 #include <sys/auxv.h>
 #define SK_NEON_FN inline __attribute__((target("fpu=neon"), always_inline))
+#define SK_NEON_BLOCK __attribute__((target("fpu=neon"), noinline))
+#define SK_NEON_ALWAYS 0
+#endif
 #else
 #define SK_NEON 0
 #endif
@@ -164,7 +173,12 @@ struct ScopedFlushDenormals {
 inline bool neonAvailable() {
 #if SK_NEON
     const char* off = std::getenv("SK_NO_NEON");
-    return !(off && *off) && (getauxval(AT_HWCAP) & HWCAP_ARM_NEON) != 0;
+    if (off && *off) return false;
+#if SK_NEON_ALWAYS
+    return true;
+#else
+    return (getauxval(AT_HWCAP) & HWCAP_ARM_NEON) != 0;
+#endif
 #else
     return false;
 #endif
@@ -1031,7 +1045,7 @@ private:
     };
     NeonFir nf_[2];
 
-    __attribute__((target("fpu=neon"), noinline)) void oversampleBlock(Segment& seg, uint32_t m, bool sweeping,
+    SK_NEON_BLOCK void oversampleBlock(Segment& seg, uint32_t m, bool sweeping,
                                                                          float limitIn, float invLimit) {
         const int mi = static_cast<int>(m), m4 = (mi + 3) & ~3, n2 = 2 * mi, n28 = (n2 + 7) & ~7;
         float os[2][4 * kSegment + 8], acc[2 * kSegment + 8], z2[2 * kSegment + 8];

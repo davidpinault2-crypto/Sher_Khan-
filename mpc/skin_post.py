@@ -27,12 +27,19 @@ INK = (23, 24, 26)
 INK_DIM = (60, 63, 66)
 Y_OFF = 86            # layout y of the plugin area's top edge
 
+
+def version_text():
+    """vst.json's version (major * 10000 + minor * 1000 + patch, e.g. 4000) as "v0.4.0"."""
+    v = int(json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vst.json")))["version"])
+    return "v%d.%d.%d" % (v // 10000, v // 1000 % 10, v % 1000)
+
+
 # Text printed into each tab's background: (tab, text, layout x, layout y, size px, colour, weight)
 TEXTS = [
     (1, "DUAL MULTIMODE", 1113, 520, 30, INK, "SemiBold"),
     (1, "FILTER BANK", 1113, 556, 30, INK, "SemiBold"),
     (1, "model of the Sherman Filterbank 2", 1113, 612, 19, INK_DIM, "Regular"),
-    (1, "v0.3.1", 1113, 646, 19, INK_DIM, "Regular"),
+    (1, version_text(), 1113, 646, 19, INK_DIM, "Regular"),
     (2, "Arrows or Q-Link 1 pick a preset; LOAD recalls it (so does MPC's PRESET menu).", 640, 590, 22, INK_DIM, "Regular"),
     (2, "SAVE stores the current sound in the selected User slot.", 640, 626, 22, INK_DIM, "Regular"),
     (2, "Every setting is also saved with the project.", 640, 662, 22, INK_DIM, "Regular"),

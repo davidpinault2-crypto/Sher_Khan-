@@ -1,18 +1,31 @@
 # Desktop:  make            LV2 bundle + an x86 build of the VST2 plugin (for the host test)
 #           make test       DSP tests and the VST2 host test (x86)
-# Force:    make force      the MPC OS plugin, armv7 hard-float (needs arm-linux-gnueabihf-g++)
-#           make test-force the DSP tests and the host test, cross-built, against the Force .so under qemu-arm
-#                           (the host test twice: with NEON, as on the Force, and the plain path)
-# Packaging the Force plugin (skin, installer, zip) is mpc/build.sh.
+# MPC:      make force      the plugin for the Force and the other Gen1 MPCs: armv7 hard-float with NEON
+#                           (needs arm-linux-gnueabihf-g++)
+#           make arm64      the plugin for the arm64 MPCs (needs aarch64-linux-gnu-g++)
+#           make test-force the DSP tests and the host test, cross-built, against the armv7 .so under qemu-arm
+#                           (the host test twice: with NEON, as on the device, and the plain path)
+#           make test-arm64 the same against the arm64 .so under qemu-aarch64
+# Packaging (skin, Akai SDK folder, installer, zips) is mpc/build.sh.
 CXX      ?= g++
 ARMCXX   ?= arm-linux-gnueabihf-g++
 ARMCC    ?= arm-linux-gnueabihf-gcc
 QEMU     ?= qemu-arm
+A64CXX   ?= aarch64-linux-gnu-g++
+A64CC    ?= aarch64-linux-gnu-gcc
+QEMU64   ?= qemu-aarch64
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra
 # Plugin code: no C++ runtime (exceptions, RTTI) so the .so needs only libc/libm; errno-free math inlines better.
 PLUGFLAGS = -fPIC -fvisibility=hidden -fno-exceptions -fno-rtti -fno-math-errno
-# Same ISA as the community's arm32v7/gcc:12 builds (armv7-a, VFPv3-D16, hard float), tuned for the RK3288.
-ARMFLAGS  = -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard -mthumb -mtune=cortex-a17
+# The ISAs of Akai's MPC Plugin Builder SDK: armv7-a with NEON and VFPv4 (every Gen1 MPC's RK3288 has both: 32
+# double registers and fused multiply-add for the scalar code too), tuned for its Cortex-A17; armv8-a for the arm64
+# MPCs, tuned for the Cortex-A55.
+# -U_TIME_BITS: Ubuntu's armhf compilers default to 64-bit time_t, whose symbols need glibc 2.34; MPC OS 2.x has 2.32
+# (Akai's SDK targets 2.31). -mno-outline-atomics: plain armv8.0 atomics inline, without libgcc's run-time CPU check
+# (a static constructor and a __getauxval import).
+ARMFLAGS  = -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -mthumb -mtune=cortex-a17 -U_TIME_BITS
+A64FLAGS  = -march=armv8-a -mtune=cortex-a55 -mno-outline-atomics
+LINKMPC   = -lm -Wl,--no-undefined -Wl,--as-needed -Wl,-z,relro,-z,now -s
 BUNDLE   := lv2/sherkhan.lv2
 SO       := sk_filterbank.so
 
@@ -44,7 +57,7 @@ force: build/armhf/$(SO)
 build/armhf/$(SO): mpc/sk_vst.cpp dsp/ShermanCore.h
 	@mkdir -p $(@D)
 	$(ARMCXX) $(CXXFLAGS) $(ARMFLAGS) $(PLUGFLAGS) -c -o build/armhf/sk_vst.o $<
-	$(ARMCC) $(ARMFLAGS) -shared -o $@ build/armhf/sk_vst.o -lm -Wl,--no-undefined -Wl,--as-needed -Wl,-z,relro,-z,now -s
+	$(ARMCC) $(ARMFLAGS) -shared -o $@ build/armhf/sk_vst.o $(LINKMPC)
 
 build/armhf/test_vst: tests/test_vst.cpp dsp/ShermanCore.h
 	@mkdir -p $(@D)
@@ -59,7 +72,28 @@ test-force: build/armhf/$(SO) build/armhf/test_vst build/armhf/test_core
 	$(QEMU) -L /usr/arm-linux-gnueabihf ./build/armhf/test_vst build/armhf/$(SO)
 	SK_NO_NEON=1 $(QEMU) -L /usr/arm-linux-gnueabihf ./build/armhf/test_vst build/armhf/$(SO)
 
+# ---- arm64 MPCs ----
+arm64: build/arm64/$(SO)
+
+build/arm64/$(SO): mpc/sk_vst.cpp dsp/ShermanCore.h
+	@mkdir -p $(@D)
+	$(A64CXX) $(CXXFLAGS) $(A64FLAGS) $(PLUGFLAGS) -c -o build/arm64/sk_vst.o $<
+	$(A64CC) $(A64FLAGS) -shared -o $@ build/arm64/sk_vst.o $(LINKMPC)
+
+build/arm64/test_vst: tests/test_vst.cpp dsp/ShermanCore.h
+	@mkdir -p $(@D)
+	$(A64CXX) $(CXXFLAGS) $(A64FLAGS) -o $@ $< -ldl
+
+build/arm64/test_core: tests/test_core.cpp dsp/ShermanCore.h
+	@mkdir -p $(@D)
+	$(A64CXX) $(CXXFLAGS) $(A64FLAGS) -o $@ $<
+
+test-arm64: build/arm64/$(SO) build/arm64/test_vst build/arm64/test_core
+	$(QEMU64) -L /usr/aarch64-linux-gnu ./build/arm64/test_core
+	$(QEMU64) -L /usr/aarch64-linux-gnu ./build/arm64/test_vst build/arm64/$(SO)
+	SK_NO_NEON=1 $(QEMU64) -L /usr/aarch64-linux-gnu ./build/arm64/test_vst build/arm64/$(SO)
+
 clean:
 	rm -rf build $(BUNDLE)/sherkhan.so
 
-.PHONY: all test force test-force clean
+.PHONY: all test force test-force arm64 test-arm64 clean
