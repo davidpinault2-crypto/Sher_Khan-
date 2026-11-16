@@ -447,7 +447,7 @@ int main() {
         check(!g.asleep() && bleed > 1e-3f, "An audible clock bleed keeps it awake (grit 1, 100 Hz cutoff)", bleed);
     }
 #if SK_NEON
-    {   // On ARM: the NEON path (picked at load time) and the plain one agree to rounding.
+    {   // On ARM: the NEON path and the plain one (SK_NO_NEON=1) agree to rounding.
         unsetenv("SK_NO_NEON");
         sk::ShermanCore a;
         setenv("SK_NO_NEON", "1", 1);

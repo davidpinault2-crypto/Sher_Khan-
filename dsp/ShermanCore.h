@@ -20,8 +20,9 @@
 //     depth, filter 2 in or out of phase with filter 1.
 //   * FM: the input audio sweeps both cutoffs. AM: the output is amplitude-modulated by filter 2's output.
 //   * BYP/EFF dry/wet, plus OUTPUT gain and the GRIT amount (plugin additions).
-// All nonlinear processing runs 4x oversampled through two cascaded linear-phase halfband FIR stages, so the
-// wet path is delayed by kLatency samples; the dry path of the mix is delayed to match.
+// All nonlinear processing runs 4x oversampled through two cascaded linear-phase halfband FIR stages, and a short
+// linear-phase FIR afterwards undoes the low-pass of the overdrive's anti-aliasing, so the wet path is delayed by
+// kLatency samples; the dry path of the mix is delayed to match.
 //
 // Smooth operation: knobs glide (cutoffs 30 ms, the rest 15 ms) and every switch changes without a click: LIMIT
 // rescales the filter states, a new LFO shape glides in (30 ms) and SINE TRIG restarts are declicked (2 ms), LFO
@@ -31,7 +32,7 @@
 // trick), the overdrive one per four steps, the output limit none below 0 dBFS; both channels share each FIR
 // coefficient load. Processing runs in segments of up to 32 samples: control per sample, then the oversampled
 // path, then the output. Glides are linear ramps per segment that cost nothing once settled, and static cutoffs
-// are worked out once per segment. With NEON (picked at load time) the oversampled path runs a whole segment at a
+// are worked out once per segment. With NEON (every MPC has it) the oversampled path runs a whole segment at a
 // time: the FIRs four outputs at a time, the overdrive four steps at a time (every ADAA case, including the knee
 // crossings, without a division), the filters both channels at a time with their states in registers. After a
 // few ms of silence with nothing sounding it sleeps (see asleep()).

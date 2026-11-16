@@ -1,52 +1,44 @@
 # Sher Khan Filterbank
 
 A model of the **Sherman Filterbank 2**: two multimode filters with an input overdrive, ADSR / AR / envelope
-follower, LFO, audio FM and AM, laid out like the hardware's front panel. It runs on the **Akai Force** as a native
-MPC OS insert effect: a VST2 plugin with three touchscreen pages in the unit's silver-grey look. Its full state is
-saved with the project, it has factory and user presets, and it installs with root access from MockbaMod. See
-**[mpc/README.md](mpc/README.md)** to install it. The same DSP core also builds as an LV2 plugin for desktop
-listening tests.
+follower, LFO, audio FM and AM, laid out like the hardware's front panel. It runs on the **Akai Force** and the other
+MPCs as a native MPC OS insert effect: a VST2 plugin with three touchscreen pages in the unit's silver-grey look. Its
+full state is saved with the project, and it has factory and user presets. See **[mpc/README.md](mpc/README.md)** to
+install it. The same DSP core also builds as an LV2 plugin for desktop listening tests.
 
-**Download for the Force:** [`dist/SK-Filterbank-0.3.1-mpc-armv7.zip`](dist/SK-Filterbank-0.3.1-mpc-armv7.zip)
+**Downloads:**
+- MPC OS **3.10.1 or later**, any MPC: [`dist/SK-Filterbank-0.4.0-mpc-sdk.zip`](dist/SK-Filterbank-0.4.0-mpc-sdk.zip),
+  a folder for `VST2 Plugins` on a drive (Akai's official external plugin support, no root).
+- MPC OS **3.10.0 or older**, Force and the other Gen1 MPCs: [`dist/SK-Filterbank-0.4.0-mpc-armv7.zip`](dist/SK-Filterbank-0.4.0-mpc-armv7.zip),
+  installed over SSH with root from MockbaMod.
 
-**New in 0.3.1:** less CPU again. Controls and saved state are unchanged.
-- **Silence costs almost nothing.** After a few ms of silent input, the plugin stops processing and outputs exact
-  silence, provided nothing in it can sound by itself: no self-oscillation, envelope at rest, no knob gliding. MPC
-  keeps feeding silent tracks and a stopped transport, so in a real project this is most of the saving. Any input,
-  knob change or TRIG wakes it at once.
-- **Faster with sound too.** With NEON the oversampled path now runs 32 samples at a time instead of one. Per block
-  that is 170k instructions instead of 221k for the Init sound (23% fewer, 67% fewer than 0.2.0). Heavily driven
-  sounds gain the most (Crusher: 292k to 217k).
-- **One sound change: grit's clock bleed is now heard only while the clock itself is audible** (cutoffs under about
-  200-400 Hz). Above that the real chip's clock is ultrasonic. The plugin's square wave up there only aliased down
-  into a faint whine, about -72 dBFS on silent input with the default settings. That whine is gone, which also lets
-  the plugin sleep. The grit sampling effect is unchanged.
-
-**0.3.0:** less CPU and smoother operation, with the same controls. The sound changed in three details:
-- The output safety limiter is now exactly linear up to 0 dBFS (0.2.0's took 0.16 dB off a full-scale signal).
-- With LIMIT on, AM and the clock bleed sound the same as with it off.
-- The cutoff knobs glide over 30 ms instead of 15.
-
-The other changes:
-- **CPU.** With NEON, which the Force's processor has, it runs 57% fewer instructions per block than 0.2.0. That is
-  counted on the ARM build under emulation, not yet timed on a Force. The audio path makes no divisions (0.2.0 made
-  46 per sample) and normally no math-library calls (0.2.0 made at least four per sample).
-- **Switches.** LIMIT, HARMONICS, LFO F2 and the LFO shape no longer click when you switch them during playback.
-- **Presets.** Picking a preset during playback crossfades from the old sound to the new one in 30 ms.
-
-Projects and User presets from 0.2.0 and 0.3.0 load unchanged. See [mpc/README.md](mpc/README.md#whats-new-in-031).
+**New in 0.4.0** ([details](mpc/README.md#whats-new-in-040)). Projects and User presets from 0.2.0 on load unchanged.
+- **Akai's official route:** a package in the MPC Plugin Builder SDK's folder format, with armv7 and arm64 builds.
+- **Checked against Akai's published host contract**, which fixed:
+  - a +21 dB one-buffer burst when MPC nudges the first parameter during playback (3.9.1 does it on STOP);
+  - SAVE and LOAD touching the drive on the audio thread;
+  - the PRESET menu closing after every pick;
+  - double-firing buttons;
+  - Q-Link turns that stepped switches the wrong way.
+- **Better sound:** the top end stays open. With the filters wide open, 18 kHz is 0.5 dB down instead of 0.95 dB,
+  because the overdrive's anti-aliasing no longer dulls the wet path.
+- **Less CPU in silence** (about half of 0.3.1), and less per-buffer overhead with small buffers.
 
 ## Read this first
 
-- **Unofficial.** Akai doesn't support third-party plugins on standalone MPC OS. Loading one needs root (MockbaMod) and
-  an edit of MPC's plugin list. The included installer backs that list up first. Use at your own risk.
+- **Not made or endorsed by Akai.** MPC OS 3.10.1 and later load external VST2 plugins officially (Preferences >
+  Enhancements). On 3.10.0 and older, loading one needs root (MockbaMod) and an edit of MPC's plugin list; the included
+  installer backs that list up first. Use at your own risk.
+- **Akai did not open-source MPC OS.** It published the MPC Plugin Builder SDK (the host contract and folder format
+  this plugin follows) and the source of the device's GPL parts. The plugin host itself is closed.
 - **Not a 1:1 clone.** No schematics, impulse responses or recordings of a unit went into it. The controls and their
   behaviour follow the Filterbank 2 manual excerpts and reviews that are public. Where those are silent (the 11
   harmonic ratios, the exact curves, the knob colours), the choice is ours and marked in the code. Matching a specific
   unit "exactly" needs one on the bench (see *Calibration*).
-- **Not yet run on a Force.** The ARM binary passes the full host test under emulation and the installer passes dry
-  runs under the Force's BusyBox version. Loading, CPU and the pages on the real device are still unverified
-  ([mpc/README.md](mpc/README.md) lists exactly what was checked).
+- **Not yet run on an MPC.** Both ARM binaries pass the full host test under emulation, both packages pass a check
+  against Akai's folder rules, and the MockbaMod installer passed dry runs under the Force's BusyBox version. Loading,
+  CPU and the pages on a real device are still unverified ([mpc/README.md](mpc/README.md) lists exactly what was
+  checked).
 
 ## Signal path
 
@@ -54,14 +46,16 @@ Projects and User presets from 0.2.0 and 0.3.0 load unchanged. See [mpc/README.m
 in ─► INPUT gain (-30..+40 dB, unity at noon) ─► Hi Cut/Flat/Hi Boost ─► overdrive (asymmetric soft clip, ADAA)
    ─► [switched-cap sampling @ 50 x fc] ─► FILTER 1 (L-B-H morph + Correction) ─┐
    ─► PAR/SER blend: parallel (1 + 2) ... serial (1 into 2) ─► FILTER 2 ────────┴─► AM (by filter 2's output)
-   ─► safety limiter (linear to 0 dBFS, soft up to +12 dBFS) ─► DC block ─► OUTPUT ─► BYP/EFF with the latency-matched dry signal
+   ─► safety limiter (linear to 0 dBFS, soft up to +12 dBFS) ─► top-end compensation ─► DC block ─► OUTPUT
+   ─► BYP/EFF with the latency-matched dry signal
 cutoffs = FREQ + ADSR depth x envelope + LFO (filter 2 in or out of phase) + FM (the input audio);
 HARMONICS can lock filter 2 to filter 1 at a fixed ratio.
 envelope = ADSR / AR / follower, triggered by the level after INPUT (SENSITRIG = twice as sensitive), or TRIG
 ```
 
 Everything between the overdrive and the limiter runs **4x oversampled** through two linear-phase halfband FIR stages
-(63 and 21 taps, 36 samples latency, reported to the host).
+(63 and 21 taps). A 5-tap linear-phase filter afterwards undoes the low-pass that the overdrive's anti-aliasing adds
+(a two-sample average at 4x). Together: 38 samples of latency, reported to the host and matched on the dry path.
 
 | Hardware trait | How it is modelled |
 |---|---|
@@ -70,8 +64,9 @@ Everything between the overdrive and the limiter runs **4x oversampled** through
 | Input overdrive | Asymmetric Pade-tanh clipper (even harmonics), unity small-signal gain, first-order antiderivative anti-aliasing |
 | Correction knob | Adds band-pass (left) or LP + HP - BP (right), so band-pass mode becomes a notch |
 
-Measured (see `tests/test_core.cpp`): the passband is flat to within 0.1 dB, and with both filters open 10 kHz is within
-0.3 dB. Worst alias below 16 kHz on a 3.7 kHz tone is -76 dBc at +30 dB input and -56 dBc at +40 dB.
+Measured (see `tests/test_core.cpp`): with both filters wide open, 10 kHz is within 0.15 dB and 18 kHz within 0.6 dB
+(0.11 and 0.51 dB; what's left is the filters themselves at their 40 kHz maximum). Worst alias below 16 kHz on a
+3.7 kHz tone is -76 dBc at +30 dB input and -56 dBc at +40 dB.
 
 | Smooth operation | How |
 |---|---|
@@ -85,20 +80,22 @@ Measured (see `tests/test_core.cpp`): the passband is flat to within 0.1 dB, and
 |---|---|
 | No divisions, (almost) no libm on the audio path | The cutoff comes from a compile-time table. The divisions that remain share one reciprocal (Montgomery's trick), and the output limiter needs none below 0 dBFS. |
 | Segments | Each block runs in segments of up to 32 samples: control per sample, then the oversampled path, then the output. Glides are linear ramps per segment that cost nothing once settled, and steady cutoffs are worked out once per segment. |
-| NEON, picked at load time | The oversampled path runs a whole segment at a time: the FIRs four outputs at a time, the overdrive four steps at a time (every ADAA case, knee crossings included, with no division), the two filters both channels at a time with their states in registers. Without NEON (or with `SK_NO_NEON=1`) the plain path runs; the two agree to -113 dB. |
-| Sleep | After 256 samples of input under -140 dBFS, with the output under -90 dBFS and nothing able to sound by itself, the DSP stops and the output is exact silence. Input, a parameter change or TRIG wakes it. |
+| NEON | Every MPC has it, and both MPC builds use it (armv7 with NEON and VFPv4, as Akai's SDK builds; arm64). The oversampled path runs a whole segment at a time: the FIRs four outputs at a time, the overdrive four steps at a time (every ADAA case, knee crossings included, with no division), the two filters both channels at a time with their states in registers. Without NEON (or with `SK_NO_NEON=1`) the plain path runs; the two agree to -110 dB. |
+| Knob-derived settings | The smoothing targets and the envelope and LFO coefficients (a dozen pow/exp) are worked out only after a parameter changed, not on every buffer. |
+| Sleep | After 256 samples of input under -140 dBFS, with the output under -90 dBFS and nothing able to sound by itself, the DSP stops and the output is exact silence. Input, a parameter change or TRIG wakes it. The silence check itself takes the largest magnitude as an integer max, four samples at a time. |
 
 ## Build and test
 
 ```sh
-make && make test        # LV2 bundle, x86 VST2 build; DSP tests (49) + VST2 host test (51)
-make force test-force    # the Force binary (arm-linux-gnueabihf-g++); under qemu-arm the DSP tests on the NEON path
+make && make test        # LV2 bundle, x86 VST2 build; DSP tests (50) + VST2 host test (68)
+make force test-force    # the armv7 binary (arm-linux-gnueabihf-g++); under qemu-arm the DSP tests on the NEON path
                          # (including NEON vs plain) and the host test with and without NEON
-mpc/build.sh             # everything above + skin + installer zip (needs the mpc-vst-plugins checkout, see mpc/README.md)
+make arm64 test-arm64    # the same for the arm64 binary (aarch64-linux-gnu-g++, qemu-aarch64)
+mpc/build.sh             # everything above + binary checks + skin + both zips (needs the mpc-vst-plugins checkout, see mpc/README.md)
 ```
 
 To listen on a desktop, copy `lv2/sherkhan.lv2` to `~/.lv2/` and load it in any LV2 host (Carla, Ardour, jalv). Its
-controls are the same 29 normalized sound parameters as the Force version (`lv2/gen_ttl.py` writes them from
+controls are the same 29 normalized sound parameters as the MPC version (`lv2/gen_ttl.py` writes them from
 `mpc/params.json`).
 
 ## Calibration (to get closer to "exact")
@@ -113,7 +110,7 @@ controls are the same 29 normalized sound parameters as the Force version (`lv2/
 ## Layout
 
 - `dsp/ShermanCore.h`: the whole DSP model, header-only, no dependencies.
-- `mpc/`: the Force/MPC OS plugin (VST2 wrapper with presets and state, pages, knob art, build, bench, install guide).
+- `mpc/`: the MPC OS plugin (VST2 wrapper with presets and state, pages, knob art, build, folder check, bench, install guide).
 - `lv2/`: desktop LV2 wrapper.
 - `tests/`: DSP tests and the VST2 host test.
-- `dist/`: the built Force package.
+- `dist/`: the built packages: `-mpc-sdk` (MPC OS 3.10.1+) and `-mpc-armv7` (MockbaMod, 3.10.0 and older).
