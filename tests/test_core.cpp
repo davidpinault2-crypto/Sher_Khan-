@@ -176,6 +176,11 @@ int main() {
         check(pk - 100 >= size_t(sk::ShermanCore::kLatency) && pk - 100 <= size_t(sk::ShermanCore::kLatency) + 1,
               "EFF: wet impulse peaks at kLatency (samples)", double(pk) - 100);
     }
+    {   // Wide open, the wet path keeps the top end: the oversampling and the ADAA's averaging are compensated, so
+        // what's left is the two filters at their 40 kHz maximum (0.95 dB down at 18 kHz before 0.4.0).
+        const double g10 = gainAt(clean(), 10000, 0.01f), g18 = gainAt(clean(), 18000, 0.01f);
+        check(g10 > -0.15 && g10 < 0.05 && g18 > -0.6 && g18 < 0.05, "open path: 10 kHz / 18 kHz within 0.15 / 0.6 dB (dB at 18 kHz)", g18);
+    }
     {   // INPUT at noon is unity; +12 dB is 12 dB louder for a small signal.
         check(std::fabs(gainAt(clean(), 1000, 0.01f)) < 0.3, "Input at noon: unity gain (dB)", gainAt(clean(), 1000, 0.01f));
         const double g12 = gainAt(clean({{sk::kInput, dbToInput(12)}}), 1000, 0.005f);

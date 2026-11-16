@@ -486,7 +486,11 @@ public:
     // Oversampling: 2x with a 63-tap halfband (~80 dB from 25.6 kHz), then 2x again with a 21-tap one
     // (its transition band can be wide: everything above 22 kHz is removed by the first stage).
     static constexpr int kL1 = 31, kL2 = 10;
-    static constexpr int kLatency = kL1 + kL2 / 2;  // base-rate samples (wet and dry alike)
+    // The ADAA's two-sample average at 4x is a gentle low-pass (-0.14 dB at 10 kHz, -0.45 dB at 18 kHz) that an
+    // analog overdrive doesn't have; a 5-tap linear-phase FIR at the base rate puts it back on the wet path
+    // (+-0.02 dB up to 18 kHz). It adds kCompDelay samples.
+    static constexpr int kCompDelay = 2;
+    static constexpr int kLatency = kL1 + kL2 / 2 + kCompDelay;  // base-rate samples (wet and dry alike)
     static constexpr float kClockRatio = 50.f;     // LTC1060 supports 50:1 / 100:1
     static constexpr float kBias = 0.25f;
     // Small-signal slope of softClip at kBias, so the overdrive is unity gain for small signals:
@@ -744,7 +748,33 @@ public:
                 }
             }
 
-            // 3. Output: DC blocker, OUTPUT gain, BYP/EFF against the latency-matched dry signal.
+            // 3. Output: ADAA droop compensation (a short FIR over the segment, in registers), then per sample the DC
+            // blocker, OUTPUT gain, BYP/EFF against the latency-matched dry signal.
+            for (int c = 0; c < 2; ++c) {
+                float buf[kSegment + 4];  // oldest first: the last 4 wet samples of the previous segment, then this one's
+                float* comp = ch_[c].comp;
+                buf[0] = comp[3];
+                buf[1] = comp[2];
+                buf[2] = comp[1];
+                buf[3] = comp[0];
+                std::memcpy(buf + 4, seg.y[c], m * sizeof(float));
+                uint32_t k = 0;
+#if SK_NEON && SK_NEON_ALWAYS
+                const float32x4_t q0 = vdupq_n_f32(kComp[0]), q1 = vdupq_n_f32(kComp[1]), q2 = vdupq_n_f32(kComp[2]);
+                for (; k + 4 <= m; k += 4) {  // the same operations in the same order as below, four at a time
+                    float32x4_t t = vmulq_f32(q0, vld1q_f32(buf + k + 2));
+                    t = vmlaq_f32(t, q1, vaddq_f32(vld1q_f32(buf + k + 3), vld1q_f32(buf + k + 1)));
+                    t = vmlaq_f32(t, q2, vaddq_f32(vld1q_f32(buf + k + 4), vld1q_f32(buf + k)));
+                    vst1q_f32(seg.y[c] + k, t);
+                }
+#endif
+                for (; k < m; ++k)
+                    seg.y[c][k] = kComp[0] * buf[k + 2] + kComp[1] * (buf[k + 3] + buf[k + 1]) + kComp[2] * (buf[k + 4] + buf[k]);
+                comp[0] = buf[m + 3];
+                comp[1] = buf[m + 2];
+                comp[2] = buf[m + 1];
+                comp[3] = buf[m];
+            }
             for (uint32_t k = 0; k < m; ++k) {
                 for (int c = 0; c < 2; ++c) {
                     Channel& ch = ch_[c];
@@ -780,6 +810,9 @@ public:
 
 private:
     static constexpr float kNoise = 3e-6f;   // ~ -110 dBFS analog noise floor
+    // The droop compensation's taps (centre, +-1, +-2): least squares on 1 / cos(pi f / 4fs) over 0..19 kHz, unity
+    // at DC. With the ADAA: +-0.02 dB to 18 kHz, -0.08 dB at 20 kHz.
+    static constexpr float kComp[3] = {1.02478f, -0.014932f, 0.002542f};
     static constexpr float kClipAtBias = softClip(kBias);
     static constexpr float kUHi = -2.0588937f;  // log2(0.24): highest cutoff 0.24 fsOs (42 kHz at 44.1 kHz)
     static constexpr uint32_t kSegment = 32;     // processed in segments of this many samples (glides ramp per segment)
@@ -848,6 +881,7 @@ private:
         float odX = kBias;  // ADAA state: previous (biased) clipper input
         float eqLp = 0;
         float dc = 0, dcX = 0;
+        float comp[4] = {};  // the last wet samples before the droop compensation, newest first
         float dry[2 * kLatency + 2] = {};
         int dryPos = 0;
         uint32_t rng = 0;
