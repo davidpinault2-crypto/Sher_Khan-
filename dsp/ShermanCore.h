@@ -508,6 +508,8 @@ public:
         detAtk_ = timeCoef(0.0005f);
         detRel_ = timeCoef(0.040f);
         detFallLog_ = std::log(1.f - detRel_);
+        dozeN_ = 0;     // both depend on the rate
+        dirty_ = true;
         uOff_ = std::log2(20.f / fsOs_);
         uLo_ = std::log2(10.f / fsOs_);
         if (uLo_ < CutoffTable::kU0) uLo_ = CutoffTable::kU0;
@@ -549,7 +551,12 @@ public:
     }
 
     void setParam(int id, float norm) {
-        if (id >= 0 && id < kNumParams) norm_[id] = norm >= 0.f ? (norm <= 1.f ? norm : 1.f) : 0.f;  // NaN -> 0
+        if (id < 0 || id >= kNumParams) return;
+        const float v = norm >= 0.f ? (norm <= 1.f ? norm : 1.f) : 0.f;  // NaN -> 0
+        if (v != norm_[id]) {
+            norm_[id] = v;
+            dirty_ = true;
+        }
     }
     float param(int id) const { return id >= 0 && id < kNumParams ? norm_[id] : 0.f; }
 
@@ -598,28 +605,19 @@ public:
             limit_ = limitIn;
         }
         const float invLimit = 1.f / limitIn;
-        const float lfoInc = std::fmin(map::lfoHz(norm_[kLfoSpeed]) / fs_, 0.49f);
-        if (asleep_) {
+        if (asleep_) {  // asleep, nothing has changed since (the cached controls are still the ones it slept with)
             if (manualHold_ == 0 && unchangedSinceSleep() && quiet(inL, n) && (!inR || quiet(inR, n))) {
-                doze(n, lfoInc);
-                for (uint32_t i = 0; i < n; ++i) {
-                    outL[i] = 0.f;
-                    if (outR) outR[i] = 0.f;
-                }
+                doze(n, ctl_.lfoInc);
+                std::memset(outL, 0, n * sizeof(float));
+                if (outR) std::memset(outR, 0, n * sizeof(float));
                 return;
             }
             asleep_ = false;
         }
-        computeTargets();
+        if (dirty_) refreshControls();  // the targets and the coefficients below: only after a parameter changed
+        const float lfoInc = ctl_.lfoInc;
         const float threshold = trigMode == kSensiTrig ? 0.5f * kTrigThreshold : kTrigThreshold;
-        // Envelope coefficients. The attack aims past 1 (an RC charging towards a higher rail) so it lands on the
-        // peak in the knob's time; decay and release reach ~98% of the way in the knob's time.
-        const float aC = timeCoef(map::attackMs(norm_[kAttack]) * 0.001f / 1.466f);
-        const float dC = timeCoef(map::decayMs(norm_[kDecay]) * 0.001f / 4.f);
-        const float rC = timeCoef(map::releaseMs(norm_[kRelease]) * 0.001f / 4.f);
-        const float sus = map::sustain(norm_[kSustain]);
-        const float sens = std::pow(8.f, sus);  // follower: the sustain knob is the sensitivity, -18 .. +18 dB
-        const float fAtk = timeCoef(map::attackMs(norm_[kAttack]) * 0.001f);
+        const float aC = ctl_.aC, dC = ctl_.dC, rC = ctl_.rC, sus = ctl_.sus, sens = ctl_.sens, fAtk = ctl_.fAtk;
         float inPeak = 0.f, outPeak = 0.f;
         bool bad = false;
         Segment seg;
@@ -933,6 +931,23 @@ private:
             lfoJump_ = true;
             lfoGlide_ = glideRestart_;
         }
+    }
+
+    // Everything process() derives from the knobs through libm, worked out again only when a knob has changed (with
+    // MPC's 32-frame buffers this was a dozen pow/exp calls every 0.7 ms for nothing).
+    void refreshControls() {
+        computeTargets();
+        ctl_.lfoInc = std::fmin(map::lfoHz(norm_[kLfoSpeed]) / fs_, 0.49f);
+        // Envelope coefficients. The attack aims past 1 (an RC charging towards a higher rail) so it lands on the
+        // peak in the knob's time; decay and release reach ~98% of the way in the knob's time.
+        const float atk = map::attackMs(norm_[kAttack]) * 0.001f;
+        ctl_.aC = timeCoef(atk / 1.466f);
+        ctl_.fAtk = timeCoef(atk);  // the follower's attack
+        ctl_.dC = timeCoef(map::decayMs(norm_[kDecay]) * 0.001f / 4.f);
+        ctl_.rC = timeCoef(map::releaseMs(norm_[kRelease]) * 0.001f / 4.f);
+        ctl_.sus = map::sustain(norm_[kSustain]);
+        ctl_.sens = std::pow(8.f, ctl_.sus);  // follower: the sustain knob is the sensitivity, -18 .. +18 dB
+        dirty_ = false;
     }
 
     void computeTargets() {
@@ -1410,10 +1425,26 @@ private:
         return st;
     }
 
+    // Every |x| < kQuietIn: the largest magnitude as an integer max of the bit patterns (a NaN counts as loud).
     static bool quiet(const float* x, uint32_t n) {
-        for (uint32_t i = 0; i < n; ++i)
-            if (!(std::fabs(x[i]) < kQuietIn)) return false;
-        return true;
+        uint32_t i = 0, top = 0;
+#if SK_NEON && SK_NEON_ALWAYS
+        uint32x4_t m = vdupq_n_u32(0);
+        const uint32x4_t magnitude = vdupq_n_u32(0x7fffffffu);
+        for (; i + 4 <= n; i += 4) m = vmaxq_u32(m, vandq_u32(vreinterpretq_u32_f32(vld1q_f32(x + i)), magnitude));
+        uint32x2_t m2 = vmax_u32(vget_low_u32(m), vget_high_u32(m));
+        top = vget_lane_u32(vpmax_u32(m2, m2), 0);
+#endif
+        for (; i < n; ++i) {
+            uint32_t b;
+            std::memcpy(&b, x + i, sizeof b);
+            b &= 0x7fffffffu;
+            top = b > top ? b : top;
+        }
+        const float limit = kQuietIn;
+        uint32_t lim;
+        std::memcpy(&lim, &limit, sizeof lim);
+        return top < lim;
     }
     bool unchangedSinceSleep() const {
         for (int i = 0; i < kNumParams; ++i)
@@ -1430,7 +1461,11 @@ private:
         lfoPhase_ += static_cast<float>(n) * lfoInc;
         lfoPhase_ -= std::floor(lfoPhase_);
         lfo_ = lfoShape_ == kSaw ? 2.f * lfoPhase_ - 1.f : sinCycle(lfoPhase_);
-        det_ *= std::exp(static_cast<float>(n) * detFallLog_);
+        if (n != dozeN_) {  // the host's block size: the same every time
+            dozeN_ = n;
+            dozeFall_ = std::exp(static_cast<float>(n) * detFallLog_);
+        }
+        det_ *= dozeFall_;
     }
 
     void rescaleFilters(float r) {
@@ -1450,6 +1485,10 @@ private:
     Halfband<kL1> hb1_{8.0};
     Halfband<kL2> hb2_{7.0};
     float norm_[kNumParams];
+    struct Controls { float lfoInc, aC, dC, rC, sus, sens, fAtk; } ctl_ = {};
+    bool dirty_ = true;          // a parameter changed since ctl_ and the targets were worked out
+    uint32_t dozeN_ = 0;         // doze(): the block size dozeFall_ is for
+    float dozeFall_ = 1.f;
     float tgt_[kNumSmoothed] = {}, cur_[kNumSmoothed] = {}, inc_[kNumSmoothed] = {}, end_[kNumSmoothed] = {};
     uint8_t moving_[kNumSmoothed] = {};
     int numMoving_ = 0;
