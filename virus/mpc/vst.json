@@ -1,0 +1,9 @@
+{
+  "name": "SK TI Link",
+  "vendor": "Sher Khan",
+  "uid": "ShTl",
+  "version": 1000,
+  "so": "sk_ti_link.so",
+  "params": "params.json",
+  "layout": "layout.conf"
+}

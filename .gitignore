@@ -2,3 +2,5 @@ build/
 mpc/build/
 *.so
 __pycache__/
+virus/build/
+virus/mpc/build/

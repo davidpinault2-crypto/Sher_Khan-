@@ -12,6 +12,12 @@ install it. The same DSP core also builds as an LV2 plugin for desktop listening
 - MPC OS **3.10.0 or older**, Force and the other Gen1 MPCs: [`dist/SK-Filterbank-0.4.0-mpc-armv7.zip`](dist/SK-Filterbank-0.4.0-mpc-armv7.zip),
   installed over SSH with root from MockbaMod.
 
+**Also in this repository: [SK TI Link](virus/README.md)**, a plugin that drives an Access Virus TI / TI2 connected to
+the MPC by USB (MIDI only: Linux has no driver for the TI's USB audio). Every Single parameter on 15 pages, READ / SEND /
+LOAD / STORE, notes from the track, the patch saved with the project. Downloads:
+[`SK-TI-Link-0.1.0-mpc-sdk.zip`](dist/SK-TI-Link-0.1.0-mpc-sdk.zip) (MPC OS 3.10.1+) and
+[`SK-TI-Link-0.1.0-mpc-armv7.zip`](dist/SK-TI-Link-0.1.0-mpc-armv7.zip) (3.10.0 and older, MockbaMod).
+
 **New in 0.4.0** ([details](mpc/README.md#whats-new-in-040)). Projects and User presets from 0.2.0 on load unchanged.
 - **Akai's official route:** a package in the MPC Plugin Builder SDK's folder format, with armv7 and arm64 builds.
 - **Checked against Akai's published host contract**, which fixed:
