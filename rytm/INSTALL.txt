@@ -1,0 +1,19 @@
+SK Rytm @VERSION@ for MPC OS 3.10.1 and later (Force, MPC Live / One / X / Key, and the 64-bit MPCs)
+Overbridge for the Elektron Analog Rytm MKII. Two plugins:
+  SK Rytm Track  (instrument)    one AR output (Main, a track, or the input) on an MPC track
+  SK Rytm Send   (insert effect) sends an MPC track into one of the AR's inputs
+
+Install
+1. Copy both folders ("Sher Khan - VST - SK Rytm Track" and "Sher Khan - VST - SK Rytm Send") into a folder named
+   exactly "VST2 Plugins" at the top of a drive (SD card, USB drive, or the MPC's internal drive).
+2. On the MPC: Preferences > Enhancements, turn on "Enable Enhancements" and "External Plugin Support".
+   For more than 8 plugin tracks, also turn on the unlimited audio/plugin tracks enhancement there (experimental).
+3. Restart the MPC.
+4. On the Analog Rytm MKII: SETTINGS > SYSTEM > USB CONFIG, choose OVERBRIDGE. Connect it to the MPC's USB host
+   port (USB-A).
+5. Add a plugin track with SK Rytm Track (External Plugins, Sher Khan). Pick the AR output with SOURCE (or the
+   PRESET menu). One track per AR output; add MPC's effects to each track.
+
+The status line reads "AR MKII streaming ..." once the AR is found.
+On MPC OS 3.10.0 or older, use SK-Rytm-Track-@VERSION@-mpc-armv7.zip and SK-Rytm-Send-@VERSION@-mpc-armv7.zip
+(root SSH, e.g. MockbaMod).

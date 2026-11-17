@@ -1,0 +1,47 @@
+{
+  "name": "SK Rytm Send",
+  "params": [
+    {
+      "key": "thru",
+      "name": "Monitor",
+      "options": [
+        "Thru",
+        "Mute"
+      ],
+      "default": 0
+    },
+    {
+      "key": "dest",
+      "name": "Send To",
+      "options": [
+        "Main In",
+        "FX In",
+        "BD In",
+        "SD In",
+        "RS/CP In",
+        "BT In",
+        "LT In",
+        "MT/HT In",
+        "CH/OH In",
+        "CY/CB In",
+        "Off"
+      ],
+      "default": 0
+    },
+    {
+      "key": "level",
+      "name": "Level",
+      "min": 0,
+      "max": 1,
+      "default": 0.833333
+    },
+    {
+      "key": "status",
+      "name": "Status",
+      "min": 0,
+      "max": 1,
+      "display": "string",
+      "type": "readout"
+    }
+  ]
+}

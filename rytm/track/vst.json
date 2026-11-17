@@ -1,0 +1,12 @@
+{
+  "name": "SK Rytm Track",
+  "vendor": "Sher Khan",
+  "uid": "ShRt",
+  "version": 1000,
+  "so": "sk_rytm_track.so",
+  "params": "params.json",
+  "layout": "layout.conf",
+  "cc": false,
+  "nrpn": false,
+  "about": "Overbridge for the Elektron Analog Rytm MKII: plays one of the AR's 12 USB outputs (Main L/R, BD, SD, RS/CP, BT, LT, MT/HT, CH/OH, CY/CB, Input) on its own MPC track, sample-aligned with the others, so each gets MPC's effects, sends and sidechains. Optional MIDI to the AR. Needs the AR in Overbridge mode on the MPC's USB host port."
+}

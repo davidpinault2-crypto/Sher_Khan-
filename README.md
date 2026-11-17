@@ -1,3 +1,10 @@
+# Sher Khan plugins for MPC OS
+
+| Plugin | What it is |
+|---|---|
+| **SK Filterbank** (below) | A model of the Sherman Filterbank 2, as an insert effect |
+| **[SK Rytm](rytm/README.md)** | Overbridge for the Elektron Analog Rytm MKII: each AR output on its own MPC track (aligned, with MPC's effects), and MPC tracks sent into the AR. Downloads: [`dist/SK-Rytm-0.1.0-mpc-sdk.zip`](dist/SK-Rytm-0.1.0-mpc-sdk.zip) (MPC OS 3.10.1+), [`SK-Rytm-Track`](dist/SK-Rytm-Track-0.1.0-mpc-armv7.zip) and [`SK-Rytm-Send`](dist/SK-Rytm-Send-0.1.0-mpc-armv7.zip) `-0.1.0-mpc-armv7.zip` (3.10.0 and older, MockbaMod). **Not yet run with a real AR.** |
+
 # Sher Khan Filterbank
 
 A model of the **Sherman Filterbank 2**: two multimode filters with an input overdrive, ADSR / AR / envelope

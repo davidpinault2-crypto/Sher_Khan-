@@ -2,3 +2,6 @@ build/
 mpc/build/
 *.so
 __pycache__/
+rytm/build/
+rytm/track/build/
+rytm/send/build/

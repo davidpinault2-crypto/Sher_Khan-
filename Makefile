@@ -7,6 +7,7 @@
 #                           (the host test twice: with NEON, as on the device, and the plain path)
 #           make test-arm64 the same against the arm64 .so under qemu-aarch64
 # Packaging (skin, Akai SDK folder, installer, zips) is mpc/build.sh.
+# SK Rytm (Overbridge for the Analog Rytm MKII): see rytm/rytm.mk (make rytm-test, make rytm-arm) and rytm/build.sh.
 CXX      ?= g++
 ARMCXX   ?= arm-linux-gnueabihf-g++
 ARMCC    ?= arm-linux-gnueabihf-gcc
@@ -92,6 +93,8 @@ test-arm64: build/arm64/$(SO) build/arm64/test_vst build/arm64/test_core
 	$(QEMU64) -L /usr/aarch64-linux-gnu ./build/arm64/test_core
 	$(QEMU64) -L /usr/aarch64-linux-gnu ./build/arm64/test_vst build/arm64/$(SO)
 	SK_NO_NEON=1 $(QEMU64) -L /usr/aarch64-linux-gnu ./build/arm64/test_vst build/arm64/$(SO)
+
+include rytm/rytm.mk
 
 clean:
 	rm -rf build $(BUNDLE)/sherkhan.so

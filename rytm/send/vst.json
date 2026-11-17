@@ -1,0 +1,13 @@
+{
+  "name": "SK Rytm Send",
+  "vendor": "Sher Khan",
+  "uid": "ShRs",
+  "version": 1000,
+  "so": "sk_rytm_send.so",
+  "params": "params.json",
+  "layout": "layout.conf",
+  "cc": false,
+  "nrpn": false,
+  "effect": true,
+  "about": "Overbridge for the Elektron Analog Rytm MKII: sends this track's audio into one of the AR's 12 USB inputs (Main In, FX In or a track's input), with or without hearing it on MPC. Needs the AR in Overbridge mode on the MPC's USB host port."
+}
